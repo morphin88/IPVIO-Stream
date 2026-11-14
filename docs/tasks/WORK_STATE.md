@@ -55,3 +55,12 @@ Also done in this round (12 Nov 2026, afternoon, pushed together, device test by
 ## Next step
 
 Device tests of T-015 (steps in its task file; needs a test release with `update.json`) and of T-014 (first-start update card). Mode switch fix, demo mode, favorites reorder, settings reset: confirmed working by the maintainer on 12 Nov 2026. Still open: device tests of #45 backup, #47 Stalker, #49, #50, #52. Then decide T-010 and T-012 against the on-demand loading, and PR #40 / PR #9.
+
+## Fork note: Bulgarian subtitles (branch `feature/bg-subtitles`, 14 Nov 2026)
+
+Work in the fork `morphin88/IPVIO-Stream`, not requested by the upstream maintainer and without a task ID.
+
+- Done: `BgSubLogic.kt` (subsunacs.net search form and result parsing, entry choice, Windows-1251, MicroDVD to SubRip) with `BgSubLogicTest.kt`; `SubArchive.kt` (libarchive: RAR 4/5, ZIP, 7z); `SubSearch.kt` (subsunacs.net as third source when Bulgarian is wanted, `auto`); `SubSearchLogic.Hit.fps`; `PlayerScreen.kt` (automatic search once the stream plays, only with Bulgarian as subtitle language); `Store.kt`, `DictG.kt`, `DictNl3.kt` ("Bulgarisch"); `app/build.gradle.kts` (dependency `me.zhanghai.android.libarchive:library:1.1.6`); `CHANGELOG.md`.
+- Checks that ran: CI run 43596973130 on the fork (unit tests and debug APK) green. The search form and result parsing were compared with the live site in a browser.
+- **Not run:** device test. Unverified on a device: the request from the app (User-Agent, Referer), libarchive loading, attaching after the start.
+- Open: subs.sab.bz and yavka.net as further sources; season packs ("Complete Season" rows are ignored); titles that the playlist gives in another language than the site (no lookup of the original title yet).
