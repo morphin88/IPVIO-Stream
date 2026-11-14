@@ -64,7 +64,11 @@ android {
             manifestPlaceholders["appLabel"] = "IPVIO Stream"
         }
         release {
-            if (hasKeystore) signingConfig = signingConfigs.getByName("release")
+            // Fork build (Bulgarian subtitles): own app ID and name, so it installs next to the official app.
+            applicationIdSuffix = ".bg"
+            manifestPlaceholders["appLabel"] = "IPVIO Stream BG"
+            // Without a release key the build is signed with the debug key, so that the optimized build can be installed at all.
+            signingConfig = if (hasKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
             optimization {
                 // R8 runs over the whole app in the classic way, without packageScope (T-024, ADR 0005). The libraries (Compose,
                 // Media3, OkHttp, Kotlin) are shrunk and optimized; without that Compose runs unoptimized and the UI is noticeably
