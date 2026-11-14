@@ -5,23 +5,56 @@ import java.text.Normalizer
 import java.util.Locale
 
 /**
- * Bulgarian subtitle sites (no API, no key): search form and result page of subsunacs.net, plus what their files need
- * before Media3 can show them: archive type, choice of the file inside, Windows-1251 text and frame-based MicroDVD
+ * Bulgarian subtitle sites (no API, no key): search and result pages of subsunacs.net and subs.sab.bz, plus what their
+ * files need before Media3 can show them: archive type, choice of the file inside, Windows-1251 text and frame-based MicroDVD
  * (.sub) subtitles. Without Android and without org.json, testable; the requests are in [SubSearch].
  *
- * The site knows no TMDB ID. Movies are found by title and year, episodes by "Title 01x02" (the site's own naming).
+ * The sites know no TMDB ID. Movies are found by title and year, episodes by "Title 01x02" (the sites' own naming) or
+ * inside a season pack ("Title - Season 2", "Title - 01 - Complete Season").
+ *
+ * Android note: the patterns here run on Android's ICU regex engine, which is stricter than the JVM's. A literal "}"
+ * must be escaped; the JVM unit tests do not catch that.
  */
 object BgSubLogic {
     const val UNACS = "SubsUnacs"
     const val UNACS_BASE = "https://subsunacs.net"
     const val UNACS_SEARCH = "$UNACS_BASE/search.php"
+    const val SAB = "SabBz"
+    /** The site has no HTTPS. */
+    const val SAB_BASE = "http://subs.sab.bz"
     /** The site's pages and form values are Windows-1251. */
     const val PAGE_CHARSET = "windows-1251"
 
-    /** One row of the result page. [path] = "/subtitles/Name-123/" (the download), [fps] 0.0 = unknown. */
+    /**
+     * One row of a result page. [path] = the download: "/subtitles/Name-123/" (subsunacs.net) or the attachment number
+     * (subs.sab.bz). [fps] 0.0 = unknown. [pack] = a whole season in one archive (set by [pick]).
+     */
     data class Row(
-        val path: String, val title: String, val year: Int?, val cds: Int, val fps: Double, val downloads: Int, val info: String
+        val path: String, val title: String, val year: Int?, val cds: Int, val fps: Double, val downloads: Int, val info: String,
+        val site: String = UNACS, val pack: Boolean = false
     )
+
+    private val LEAD_TAG = Regex("""^\s*(?:\[[^\]]{1,12}\]\s*)*(?:\p{L}{2,3}\s*[|:]\s*|\p{Lu}{2,3}\s+-\s+)?""")
+    private val NOISE = Regex("""(?i)\[[^\]]*\]|\((?:bg|бг)[^)]*\)|\b(?:bg|бг)\s?-?(?:audio|sub(?:s|titles)?|аудио|суб(?:титри)?)\b|\b(?:4k|uhd|fhd|hd|sd|2160p|1080p|720p|multi|dubbed)\b""")
+    private val LATIN = Regex("""[A-Za-z]""")
+    private val CYR = Regex("""[\u0400-\u04FF]""")
+
+    /**
+     * Title from a playlist entry as the sites know it: country prefixes ("BG| ", "[BG] "), quality and "BG AUDIO" tags
+     * removed. Of a double title ("Начало / Inception") the Latin part counts, because the sites list original titles.
+     */
+    fun cleanTitle(raw: String): String {
+        var t = NOISE.replace(LEAD_TAG.replaceFirst(raw, ""), " ").replace(Regex("""\s+"""), " ").trim(' ', '-', '|', ':', '/')
+        if (CYR.containsMatchIn(t) && LATIN.containsMatchIn(t)) {
+            t.split(Regex("""\s*[/|]\s*|\s+-\s+""")).map { it.trim() }.filter { LATIN.containsMatchIn(it) && !CYR.containsMatchIn(it) }
+                .maxByOrNull { it.length }?.let { t = it }
+        }
+        return t
+    }
+
+    /** Titles to try one after the other, without duplicates: [known] (e.g. from TMDB) first, then the cleaned playlist title. */
+    fun titles(playlist: String, known: List<String> = emptyList()): List<String> =
+        (known + cleanTitle(playlist) + playlist).map { it.trim() }.filter { plainTitle(it).isNotEmpty() }.distinctBy { plainTitle(it).lowercase(Locale.ROOT) }
 
     // ------------------------------------------------------------------ Search
 
@@ -88,31 +121,81 @@ object BgSubLogic {
         return out
     }
 
+    // ------------------------------------------------------------------ subs.sab.bz
+
+    /** Search address (GET, Windows-1251). An episode is searched by the series title; the rows are filtered afterwards. */
+    fun sabUrl(title: String, year: Int?, isEpisode: Boolean): String? {
+        val m = plainTitle(title).take(70)
+        if (m.isEmpty()) return null
+        fun enc(s: String) = URLEncoder.encode(s, PAGE_CHARSET)
+        return "$SAB_BASE/index.php?act=search&movie=${enc(m)}&select-language=2&upldr=&yr=${if (isEpisode || year == null) "" else year.toString()}&release="
+    }
+
+    /** Download address of an attachment number; null if [ref] is not a number. */
+    fun sabDownload(ref: String): String? = ref.takeIf { Regex("""^\d{1,9}$""").matches(it) }?.let { "$SAB_BASE/index.php?act=download&attach_id=$it" }
+
+    private val SAB_ROW = Regex("""(?is)<tr[^>]*class="subs-row"[^>]*>(.*?)</tr>""")
+    private val SAB_LINK = Regex("""(?is)<a\s+href="[^"]*act=download&(?:amp;)?attach_id=(\d{1,9})"[^>]*?onMouseover="([^"]*)"[^>]*>(.*?)</a>""")
+
+    /** Rows of a subs.sab.bz result page ([html] decoded from Windows-1251). Unknown markup = empty list. */
+    fun sabRows(html: String): List<Row> {
+        val out = ArrayList<Row>()
+        for (m in SAB_ROW.findAll(html)) {
+            val body = m.groupValues[1]
+            val a = SAB_LINK.find(body) ?: continue
+            // Cells after the title cell: date, language, files, frame rate, uploader, IMDb, downloads
+            val cells = CELL.findAll(body.substring(a.range.last + 1)).map { text(it.groupValues[1]) }.toList()
+            if (cells.size < 7) continue
+            val tip = unescape(unescape(a.groupValues[2]))
+            val info = text(tip.substringAfter("Доп. инфо", "").substringBefore("Забележки от екипа")).trimStart(':', ' ').take(300)
+            out.add(
+                Row(
+                    a.groupValues[1], text(a.groupValues[3]), YEAR.find(body.substring(a.range.last + 1).substringBefore("</td>"))?.groupValues?.get(1)?.toIntOrNull(),
+                    cells[2].toIntOrNull() ?: 1, cells[3].toDoubleOrNull()?.takeIf { it in 10.0..120.0 } ?: 0.0,
+                    cells[6].toIntOrNull() ?: 0, info, SAB
+                )
+            )
+        }
+        return out
+    }
+
     private fun words(s: String) = plainTitle(s).lowercase(Locale.ROOT).split(' ').filter { it.isNotEmpty() }
 
-    /** Row title without the episode part: "Breaking Bad - 01x01" → "breaking bad". */
-    private fun baseTitle(rowTitle: String) = words(EP.replace(rowTitle, " ").substringBefore(" - Complete Season"))
+    private val PACK = Regex("""(?i)\bSeason\s*0*(\d{1,2})(?!\d)|(?<!\d)0*(\d{1,2})\s*-\s*Complete\s+Season""")
+
+    /** Season number of a season-pack row ("The Last of Us - Season 2", "Breaking Bad - 01 - Complete Season"), else null. */
+    fun packSeason(rowTitle: String): Int? = PACK.find(rowTitle)?.let { (it.groupValues[1].ifEmpty { it.groupValues[2] }).toIntOrNull() }
+
+    /** Row title without the episode or season part: "Breaking Bad - 01x01" → "breaking bad". */
+    private fun baseTitle(rowTitle: String) = words(PACK.replace(EP.replace(rowTitle, " "), " "))
 
     /**
-     * Rows that fit what is playing, best first. Episode: only rows named after that episode. Movie: no episode rows, no
-     * multi-CD subtitles (they do not fit one stream), year at most one off. The title must be the same; more downloads
-     * first. An automatic choice takes the first row, so a doubtful row is dropped rather than ranked low.
+     * Rows that fit what is playing, best first. Episode: rows named after that episode, then packs of its season
+     * ([Row.pack]; the episode is looked up inside the archive). Movie: no episode or season rows, no multi-CD subtitles
+     * (they do not fit one stream), year at most one off. The title must be the same; more downloads first. An automatic
+     * choice takes the first row, so a doubtful row is dropped rather than ranked low.
      */
-    fun unacsPick(rows: List<Row>, title: String, year: Int?, season: Int, episode: Int): List<Row> {
+    fun pick(rows: List<Row>, title: String, year: Int?, season: Int, episode: Int): List<Row> {
         val want = words(title)
         if (want.isEmpty()) return emptyList()
         val isEpisode = season > 0 && episode > 0
-        return rows.filter { r ->
+        return rows.mapNotNull { r ->
+            if (baseTitle(r.title) != want) return@mapNotNull null
             val ep = EP.find(r.title)
-            val epOk = if (isEpisode) ep != null && ep.groupValues[1].toInt() == season && ep.groupValues[2].toInt() == episode
-            else ep == null && r.cds <= 1 && (year == null || r.year == null || kotlin.math.abs(year - r.year) <= 1)
-            epOk && baseTitle(r.title) == want
-        }.distinctBy { it.path }.sortedByDescending { it.downloads }
+            val pack = if (ep == null) packSeason(r.title) else null
+            when {
+                isEpisode && ep != null -> r.takeIf { ep.groupValues[1].toInt() == season && ep.groupValues[2].toInt() == episode }
+                isEpisode -> if (pack == season) r.copy(pack = true) else null
+                else -> r.takeIf { ep == null && pack == null && r.cds <= 1 && (year == null || r.year == null || kotlin.math.abs(year - r.year) <= 1) }
+            }
+        }.distinctBy { it.site + it.path }.sortedWith(compareBy<Row>({ it.pack }, { -it.downloads }))
     }
 
     /** Text for the hit list: the first release-like name from the note, otherwise the row title. */
     fun release(r: Row): String =
-        Regex("""[\w.\-\[\]]*\d{3,4}p[\w.\-\[\]]*|[\w\-]+(?:\.[\w\-]+){3,}""").find(r.info)?.value?.trim('.', '-') ?: r.title
+        if (r.pack) r.title else RELEASE.find(r.info)?.value?.trim('.', '-') ?: r.title
+
+    private val RELEASE = Regex("""[\w.\-\[\]]*\d{3,4}p[\w.\-\[\]]*|[\w\-]+(?:\.[\w\-]+){3,}""")
 
     // ------------------------------------------------------------------ Archive
 
@@ -136,8 +219,9 @@ object BgSubLogic {
     /**
      * Which file of an archive to show ([names] = entry paths). ".txt" read-me files are skipped, and so is a ".sub" that
      * has an ".idx" next to it (VobSub pictures, not text). The file named after the episode wins, ".srt" before the rest.
+     * [requireEpisode] (season pack): only a file named after the episode counts.
      */
-    fun pickEntry(names: List<String>, season: Int = 0, episode: Int = 0): String? {
+    fun pickEntry(names: List<String>, season: Int = 0, episode: Int = 0, requireEpisode: Boolean = false): String? {
         fun base(n: String) = n.substringAfterLast('/').substringAfterLast('\\')
         fun ext(n: String) = base(n).substringAfterLast('.', "").lowercase(Locale.ROOT)
         val idx = names.filter { ext(it) == "idx" }.map { it.substringBeforeLast('.').lowercase(Locale.ROOT) }.toSet()
@@ -146,8 +230,11 @@ object BgSubLogic {
             e in SUB_EXT && !(e == "txt" && README.containsMatchIn(base(n))) && !(e == "sub" && n.substringBeforeLast('.').lowercase(Locale.ROOT) in idx)
         }
         val ep = if (season > 0 && episode > 0) Regex("""(?i)(?:s0*$season\W?e0*$episode|(?<!\d)0*${season}x0*$episode)(?!\d)""") else null
-        fun score(n: String) = (if (ep?.containsMatchIn(base(n)) == true) 4 else 0) + (if (ext(n) == "srt") 2 else if (ext(n) == "txt") 0 else 1)
-        return ok.sortedBy { base(it).lowercase(Locale.ROOT) }.maxByOrNull { score(it) }
+        fun hit(n: String) = ep?.containsMatchIn(base(n)) == true
+        fun score(n: String) = (if (hit(n)) 4 else 0) + (if (ext(n) == "srt") 2 else if (ext(n) == "txt") 0 else 1)
+        // Season pack: a file that is not named after the episode would be the wrong episode
+        val pool = if (requireEpisode) ok.filter { hit(it) } else ok
+        return pool.sortedBy { base(it).lowercase(Locale.ROOT) }.maxByOrNull { score(it) }
     }
 
     // ------------------------------------------------------------------ Text
@@ -176,8 +263,9 @@ object BgSubLogic {
         return high > 0 && letters * 10 >= high * 9 && letters * 2 > alpha
     }
 
-    private val MDVD = Regex("""^\{(\d+)}\{(\d*)}(.*)$""")
-    private val MDVD_STYLE = Regex("""\{[a-zA-Z]:[^}]*}""")
+    private val MDVD = Regex("""^\{(\d+)\}\{(\d*)\}(.*)$""")
+    private val MDVD_ITALIC = Regex("""(?i)\{y:[^\}]*i[^\}]*\}""")
+    private val MDVD_STYLE = Regex("""\{[a-zA-Z]:[^\}]*\}""")
 
     /** True if [text] is MicroDVD (lines "{start frame}{end frame}text"). */
     fun isMicroDvd(text: String): Boolean = text.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.take(5).toList()
@@ -198,7 +286,7 @@ object BgSubLogic {
             if (n == 0 && from <= 1) { body.trim().replace(',', '.').toDoubleOrNull()?.takeIf { it in 10.0..120.0 }?.let { rate = it; body = "" } }
             val to = m.groupValues[2].toLongOrNull() ?: (from + (rate * 3).toLong())
             val lines = body.split('|').map { l ->
-                val italic = Regex("""(?i)\{y:[^}]*i[^}]*}""").containsMatchIn(l)
+                val italic = MDVD_ITALIC.containsMatchIn(l)
                 val t = MDVD_STYLE.replace(l, "").trim().let { if (it.startsWith("/")) it.drop(1).trim() else it }
                 if (italic && t.isNotEmpty()) "<i>$t</i>" else t
             }.filter { it.isNotEmpty() }
