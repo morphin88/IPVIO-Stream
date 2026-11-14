@@ -845,6 +845,24 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
         if (ScreenAwake.unavailable) { awakeWarn = true; delay(8000); awakeWarn = false }
     }
 
+    // Bulgarian subtitles: when none is stored for this title and the stream brings none, search and attach one by itself
+    val autoSubKey = subKey()
+    LaunchedEffect(autoSubKey) {
+        if (cur.live || !SubSearch.autoWanted() || SubSearch.saved(ctx, autoSubKey) != null) return@LaunchedEffect
+        // Subtitles switched off by hand for this title: leave it that way
+        TrackMemory.get(ctx, cur.itemId)?.let { if (it.second == null) return@LaunchedEffect }
+        // Wait until the stream plays, so that its own subtitle tracks are known
+        var waited = 0
+        while (player.playbackState != Player.STATE_READY) { delay(500); waited++; if (waited > 120) return@LaunchedEffect }
+        val own = player.currentTracks.groups.any { g ->
+            g.type == C.TRACK_TYPE_TEXT && (0 until g.length).any { TrackLogic.guess(g.getTrackFormat(it).language, g.getTrackFormat(it).label) in setOf("bg", "bul") }
+        }
+        if (own) return@LaunchedEffect
+        val q = SubSearchLogic.query(cur.title, cur.tmdbId, cur.season, cur.episode, "bg", "bg")
+        val s = SubSearch.auto(ctx, autoSubKey, q) ?: return@LaunchedEffect
+        if (subKey() == autoSubKey && SubSearch.attach(player, s)) notice = Lang.tr("Untertitel geladen") + ": " + s.label
+    }
+
     LaunchedEffect(cur.url) {
         readyOnce = false; stalls = emptyList()
         retries = 0; msg = null; boomerFail = false; buffering = true; segs = emptyList(); pos = 0; dur = 0; buffered = 0

@@ -22,7 +22,7 @@ object Langs {
     val AUDIO = listOf(
         "" to "Automatisch", "de" to "Deutsch", "en" to "Englisch", "ja" to "Japanisch", "ko" to "Koreanisch",
         "fr" to "Französisch", "es" to "Spanisch", "it" to "Italienisch", "tr" to "Türkisch", "hr" to "Kroatisch", "sr" to "Serbisch",
-        "bs" to "Bosnisch", "pt" to "Portugiesisch", "pl" to "Polnisch", "ru" to "Russisch", "ar" to "Arabisch", "nl" to "Niederländisch"
+        "bs" to "Bosnisch", "pt" to "Portugiesisch", "pl" to "Polnisch", "ru" to "Russisch", "ar" to "Arabisch", "nl" to "Niederländisch", "bg" to "Bulgarisch"
     )
     /** Second audio language: used when the first is not available. */
     val AUDIO2 = listOf("" to "Keine") + AUDIO.drop(1)

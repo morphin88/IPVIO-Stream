@@ -24,6 +24,7 @@ Polnisch¦Polish¦Lehçe¦Poljski¦Poljski¦Poljski¦Polaco¦Polonais¦Polacco
 Russisch¦Russian¦Rusça¦Ruski¦Ruski¦Ruski¦Ruso¦Russe¦Russo
 Arabisch¦Arabic¦Arapça¦Arapski¦Arapski¦Arapski¦Árabe¦Arabe¦Arabo
 Niederländisch¦Dutch¦Felemenkçe¦Holandski¦Nizozemski¦Holandski¦Neerlandés¦Néerlandais¦Olandese
+Bulgarisch¦Bulgarian¦Bulgarca¦Bugarski¦Bugarski¦Bugarski¦Búlgaro¦Bulgare¦Bulgaro
 Keine¦None¦Yok¦Nijedna¦Nijedna¦Nijedna¦Ninguna¦Aucune¦Nessuna
 Zweite Tonspur¦Second audio language¦İkinci ses dili¦Drugi jezik zvuka¦Drugi jezik zvuka¦Drugi jezik zvuka¦Segundo idioma de audio¦Deuxième langue audio¦Seconda lingua audio
 Wie die App-Sprache¦Same as app language¦Uygulama diliyle aynı¦Kao jezik aplikacije¦Kao jezik aplikacije¦Kao jezik aplikacije¦Igual que la app¦Comme la langue de l'app¦Come la lingua dell'app

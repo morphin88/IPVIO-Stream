@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Player: Bulgarian subtitles. "Bulgarian" is a subtitle (and audio) language in the settings; the online search also asks subsunacs.net (no key needed) and unpacks its RAR/ZIP/7z archives, Windows-1251 text and frame-based .sub files. With Bulgarian as subtitle language a movie or episode without a stored subtitle gets one automatically after the start. New dependency: me.zhanghai.android.libarchive. Not tested on a device
 
 ## 1.4.1
 - Fix: 1.4 did not open after the update on user devices. R8 over the whole app (T-024) is switched off again (`enable = false` in app/build.gradle.kts, the rollback from ADR 0005); versionCode 6. Cause not confirmed by a crash log (unverified). Install 1.4.1 over 1.4; data is kept (same signature)

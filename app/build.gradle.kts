@@ -108,6 +108,8 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    // Unpacks RAR (4 and 5), ZIP and 7z: the Bulgarian subtitle sites deliver archives, about half of them RAR5 (BgSubLogic, SubArchive)
+    implementation("me.zhanghai.android.libarchive:library:1.1.6")
 
     implementation("androidx.work:work-runtime-ktx:2.10.0")
 

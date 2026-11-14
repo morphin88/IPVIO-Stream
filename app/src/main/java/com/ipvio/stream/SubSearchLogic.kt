@@ -24,10 +24,12 @@ object SubSearchLogic {
         val isEpisode get() = season > 0 && episode > 0
     }
 
-    /** One hit. [ref] = OpenSubtitles file ID or SubDL download path (without key). */
+    /** One hit. [ref] = OpenSubtitles file ID, SubDL download path (without key) or subsunacs.net download path. */
     data class Hit(
         val provider: String, val ref: String, val lang: String, val release: String,
-        val hi: Boolean, val downloads: Int, val format: String
+        val hi: Boolean, val downloads: Int, val format: String,
+        /** Frame rate named by the site (0.0 = unknown); needed for frame-based MicroDVD files. */
+        val fps: Double = 0.0
     )
 
     /** API keys may contain letters, digits, "_" and "-" (SubDL: "subdl_…"), never characters that change an address. */

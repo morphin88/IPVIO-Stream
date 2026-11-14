@@ -243,4 +243,5 @@ Polnisch¦Pools
 Russisch¦Russisch
 Arabisch¦Arabisch
 Niederländisch¦Nederlands
+Bulgarisch¦Bulgaars
 """

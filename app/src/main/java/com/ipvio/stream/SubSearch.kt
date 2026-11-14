@@ -17,8 +17,8 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * Online subtitles in the player (see [SubSearchLogic]): search both services, download the chosen file, keep it per
- * title and attach it to the running stream. A subtitle chosen once is attached automatically the next time.
+ * Online subtitles in the player (see [SubSearchLogic], [BgSubLogic]): search the services, download the chosen file, keep
+ * it per title and attach it to the running stream. Bulgarian is also searched on subsunacs.net (no key needed). A subtitle chosen once is attached automatically the next time.
  */
 object SubSearch {
     private val client = Net.base.newBuilder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).build()
@@ -40,7 +40,8 @@ object SubSearch {
     private fun get(r: Request): Pair<Int, String> = client.newCall(r).execute().use { it.code to (it.body?.string().orEmpty()) }
 
     suspend fun search(q: SubSearchLogic.Query): Result = withContext(Dispatchers.IO) {
-        if (!hasKeys()) return@withContext Result(emptyList(), "Kein Schlüssel für die Untertitel-Suche. Einstellungen > API-Schlüssel")
+        val bgWanted = "bg" in q.langs && q.title.isNotBlank()
+        if (!hasKeys() && !bgWanted) return@withContext Result(emptyList(), "Kein Schlüssel für die Untertitel-Suche. Einstellungen > API-Schlüssel")
         if (q.tmdbId <= 0 && q.title.isBlank()) return@withContext Result(emptyList(), "Titel unbekannt")
         coroutineScope {
             val os = async {
@@ -55,7 +56,12 @@ object SubSearch {
                     if (code == 200) SubSearchLogic.sdHits(body, q) to null else emptyList<SubSearchLogic.Hit>() to "$code"
                 }.getOrElse { emptyList<SubSearchLogic.Hit>() to errName(it) }
             }
-            val parts = listOfNotNull(os.await()?.let { SubSearchLogic.OS to it }, sd.await()?.let { SubSearchLogic.SD to it })
+            val bg = async {
+                if (!bgWanted) null else runCatching { unacsHits(q) }.getOrElse { emptyList<SubSearchLogic.Hit>() to errName(it) }
+            }
+            val parts = listOfNotNull(
+                os.await()?.let { SubSearchLogic.OS to it }, sd.await()?.let { SubSearchLogic.SD to it }, bg.await()?.let { BgSubLogic.UNACS to it }
+            )
             val hits = SubSearchLogic.rank(parts.flatMap { it.second.first }, q, AppSettings.ccPref)
             val errs = parts.filter { it.second.second != null }.joinToString(", ") { it.first + " " + it.second.second }
             Result(hits, if (hits.isEmpty() && errs.isNotEmpty()) "Suche fehlgeschlagen: $errs" else null)
@@ -73,12 +79,14 @@ object SubSearch {
         try {
             val (name, data) = when (h.provider) {
                 SubSearchLogic.OS -> osFile(h) ?: return@withContext null to osError
+                BgSubLogic.UNACS -> unacsFile(h, season, episode) ?: return@withContext null to "Download fehlgeschlagen"
                 else -> sdFile(h, season, episode) ?: return@withContext null to "Download fehlgeschlagen"
             }
             val dir = File(c.filesDir, "subs").apply { mkdirs() }
             val ext = name.substringAfterLast('.', "srt").lowercase().takeIf { it in setOf("srt", "vtt", "ass", "ssa") } ?: "srt"
             val f = File(dir, "s" + Integer.toHexString(itemId.hashCode()) + "_" + h.lang.take(5).filter(Char::isLetterOrDigit) + "." + ext)
-            f.writeBytes(SubSearchLogic.toUtf8(data))
+            // Many files are not UTF-8: Windows-1251 for Cyrillic text, otherwise Windows-1252
+            f.writeBytes(BgSubLogic.decode(data, h.lang.startsWith("bg")).toByteArray(Charsets.UTF_8))
             val sub = Sub(f, h.lang.take(2), SubSearchLogic.label(h))
             remember(c, itemId, sub)
             prune(dir)
@@ -113,6 +121,70 @@ object SubSearch {
             if (!r.isSuccessful) return null
             return SubSearchLogic.fromZip(r.body?.bytes() ?: return null, season, episode, h.lang)
         }
+    }
+
+    // ------------------------------------------------------------------ subsunacs.net
+
+    /** The site answers scripts without a browser-like User-Agent with an empty page. */
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    private const val MAX_ARCHIVE = 8_000_000L
+
+    private fun unacsHits(q: SubSearchLogic.Query): Pair<List<SubSearchLogic.Hit>, String?> {
+        val form = BgSubLogic.unacsForm(q.title, q.year, q.season, q.episode) ?: return emptyList<SubSearchLogic.Hit>() to null
+        val r = Request.Builder().url(BgSubLogic.UNACS_SEARCH).header("User-Agent", BROWSER_UA)
+            .header("Referer", BgSubLogic.UNACS_BASE + "/index.php")
+            .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType())).build()
+        client.newCall(r).execute().use { resp ->
+            if (!resp.isSuccessful) return emptyList<SubSearchLogic.Hit>() to "${resp.code}"
+            val html = String(resp.body?.bytes() ?: ByteArray(0), charset(BgSubLogic.PAGE_CHARSET))
+            val rows = BgSubLogic.unacsPick(BgSubLogic.unacsRows(html), q.title, q.year, q.season, q.episode)
+            return rows.map { SubSearchLogic.Hit(BgSubLogic.UNACS, it.path, "bg", BgSubLogic.release(it), false, it.downloads, "archive", it.fps) } to null
+        }
+    }
+
+    /** Downloads the archive of [h] and returns the subtitle inside as UTF-8 ("sub.srt" etc.). null = nothing usable. */
+    private fun unacsFile(h: SubSearchLogic.Hit, season: Int, episode: Int): Pair<String, ByteArray>? {
+        val path = BgSubLogic.unacsPath(h.ref) ?: return null
+        val r = Request.Builder().url(BgSubLogic.UNACS_BASE + path).header("User-Agent", BROWSER_UA)
+            .header("Referer", BgSubLogic.UNACS_SEARCH).build()
+        val bytes = client.newCall(r).execute().use { resp ->
+            if (!resp.isSuccessful) return null
+            val b = resp.body ?: return null
+            if (b.contentLength() > MAX_ARCHIVE) return null
+            b.source().let { s -> s.request(MAX_ARCHIVE + 1); if (s.buffer.size > MAX_ARCHIVE) return null; s.buffer.readByteArray() }
+        }
+        if (BgSubLogic.kind(bytes) == BgSubLogic.Kind.PLAIN) {
+            return BgSubLogic.normalize("sub.srt", bytes, h.fps)?.let { "sub." + it.first to it.second }
+        }
+        val files = SubArchive.subtitles(bytes).toMutableList()
+        // Best entry first; if it is not a text subtitle (e.g. a picture-based .sub), try the next one
+        while (files.isNotEmpty()) {
+            val name = BgSubLogic.pickEntry(files.map { it.first }, season, episode) ?: return null
+            val i = files.indexOfFirst { it.first == name }
+            BgSubLogic.normalize(name, files[i].second, h.fps)?.let { return "sub." + it.first to it.second }
+            files.removeAt(i)
+        }
+        return null
+    }
+
+    // ------------------------------------------------------------------ Automatic (Bulgarian)
+
+    /** Titles already searched without success in this app run (no new search on every start of the same title). */
+    private val autoMiss = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /** Automatic download is on when Bulgarian is the subtitle language and subtitles are not switched off. */
+    fun autoWanted(): Boolean = AppSettings.subMode != TrackLogic.SUB_OFF && AppSettings.subLangEffective().take(2).lowercase() == "bg"
+
+    /**
+     * Searches Bulgarian subtitles for [itemId] and downloads the best hit (the next ones if a download fails).
+     * null = already chosen earlier, nothing found, or no connection. Does not touch the player.
+     */
+    suspend fun auto(c: Context, itemId: String, q: SubSearchLogic.Query): Sub? {
+        if (q.title.isBlank() || saved(c, itemId) != null || itemId in autoMiss) return null
+        val hits = search(q.copy(langs = listOf("bg"))).hits
+        for (h in hits.take(3)) download(c, itemId, h, q.season, q.episode).first?.let { return it }
+        autoMiss.add(itemId)
+        return null
     }
 
     // ------------------------------------------------------------------ Per title
