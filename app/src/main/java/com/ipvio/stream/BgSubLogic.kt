@@ -197,6 +197,17 @@ object BgSubLogic {
 
     private val RELEASE = Regex("""[\w.\-\[\]]*\d{3,4}p[\w.\-\[\]]*|[\w\-]+(?:\.[\w\-]+){3,}""")
 
+    // ------------------------------------------------------------------ Details page (subsunacs.net)
+
+    private val ENTRY = Regex("""(?is)<a\s+href="(/getentry\.php\?id=\d{1,9}&(?:amp;)?ei=\d{1,4})"[^>]*>([^<]{1,300})</a>""")
+
+    /**
+     * (download path, file name) of every file listed on a subsunacs.net details page, in page order. Each file can be
+     * downloaded on its own, so no archive has to be unpacked. Unknown markup = empty list.
+     */
+    fun unacsEntries(html: String): List<Pair<String, String>> =
+        ENTRY.findAll(html).map { unescape(it.groupValues[1]) to text(it.groupValues[2]) }.toList()
+
     // ------------------------------------------------------------------ Archive
 
     enum class Kind { ZIP, RAR4, RAR5, SEVENZ, PLAIN }
@@ -214,6 +225,43 @@ object BgSubLogic {
     }
 
     private val SUB_EXT = setOf("srt", "sub", "txt", "ass", "ssa", "vtt")
+    private fun extOf(name: String) = name.substringAfterLast('/').substringAfterLast('\\').substringAfterLast('.', "").lowercase(Locale.ROOT)
+
+    /**
+     * Subtitle files of a ZIP as (path, content), read with java.util.zip (no native library). ".idx" entries come with
+     * empty content (only their name matters). Files over [maxBytes], other file types and a broken ZIP are skipped.
+     */
+    fun zipSubtitles(data: ByteArray, maxFiles: Int = 60, maxBytes: Int = 4_000_000): List<Pair<String, ByteArray>> {
+        // Names are UTF-8 or, in old Bulgarian archives, Windows-1251
+        for (cs in listOf(Charsets.UTF_8, charset(PAGE_CHARSET))) {
+            val out = ArrayList<Pair<String, ByteArray>>()
+            try {
+                java.util.zip.ZipInputStream(java.io.ByteArrayInputStream(data), cs).use { z ->
+                    var seen = 0
+                    while (seen++ < 400 && out.size < maxFiles) {
+                        val e = z.nextEntry ?: break
+                        val ext = extOf(e.name)
+                        if (e.isDirectory || (ext !in SUB_EXT && ext != "idx")) continue
+                        if (ext == "idx") { out.add(e.name to ByteArray(0)); continue }
+                        val buf = java.io.ByteArrayOutputStream()
+                        val tmp = ByteArray(16384)
+                        var big = false
+                        while (true) {
+                            val n = z.read(tmp)
+                            if (n < 0) break
+                            buf.write(tmp, 0, n)
+                            if (buf.size() > maxBytes) { big = true; break }
+                        }
+                        if (!big && buf.size() > 0) out.add(e.name to buf.toByteArray())
+                    }
+                }
+                return out
+            } catch (e: Exception) {
+                // Wrong name encoding or a broken ZIP: next encoding, then give up
+            }
+        }
+        return emptyList()
+    }
     private val README = Regex("""(?i)subsunacs|sab\.bz|yavka|read.?me|procheti|прочети|изтеглено|info""")
 
     /**
@@ -223,7 +271,7 @@ object BgSubLogic {
      */
     fun pickEntry(names: List<String>, season: Int = 0, episode: Int = 0, requireEpisode: Boolean = false): String? {
         fun base(n: String) = n.substringAfterLast('/').substringAfterLast('\\')
-        fun ext(n: String) = base(n).substringAfterLast('.', "").lowercase(Locale.ROOT)
+        fun ext(n: String) = extOf(n)
         val idx = names.filter { ext(it) == "idx" }.map { it.substringBeforeLast('.').lowercase(Locale.ROOT) }.toSet()
         val ok = names.filter { n ->
             val e = ext(n)

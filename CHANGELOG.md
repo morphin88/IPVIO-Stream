@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Bulgarian subtitles, fix (fork build v3): subsunacs.net files are now downloaded one by one from the details page (no archive needed); ZIP archives are read with java.util.zip, libarchive stays for RAR/7z; the search is repeated without the year when the year finds nothing; the automatic search shows what it is doing and why it found nothing (notice on the player), and download errors name the site and the reason. Not tested on a device
 - Player: Bulgarian subtitles. "Bulgarian" is a subtitle (and audio) language in the settings; the online search also asks subsunacs.net and subs.sab.bz (no key needed; a season pack is used when the episode has no subtitle of its own; with a TMDB key the English/original title is searched) and unpacks their RAR/ZIP/7z archives, Windows-1251 text and frame-based .sub files. With Bulgarian as subtitle language a movie or episode without a stored subtitle gets one automatically after the start. New dependency: me.zhanghai.android.libarchive. Not tested on a device
 
 ## 1.4.1

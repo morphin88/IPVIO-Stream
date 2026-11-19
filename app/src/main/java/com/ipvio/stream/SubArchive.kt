@@ -6,8 +6,8 @@ import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
 /**
- * Reads subtitle files out of a downloaded archive (RAR 4/5, ZIP, 7z) with libarchive. The Bulgarian subtitle sites
- * deliver archives, and java.util.zip alone cannot open most of them. Which entry is shown is decided in [BgSubLogic].
+ * Reads subtitle files out of a downloaded archive: ZIP with java.util.zip, RAR 4/5 and 7z with libarchive. The Bulgarian
+ * subtitle sites deliver archives, and java.util.zip alone cannot open RAR. Which entry is shown is decided in [BgSubLogic].
  */
 object SubArchive {
     private val EXT = setOf("srt", "sub", "txt", "ass", "ssa", "vtt", "idx")
@@ -20,6 +20,12 @@ object SubArchive {
      * matters). Larger files, encrypted entries and broken archives are skipped; an unreadable archive = empty list.
      */
     fun subtitles(data: ByteArray): List<Pair<String, ByteArray>> {
+        // ZIP is read without the native library; libarchive is for RAR and 7z (and any ZIP the JVM cannot read)
+        if (BgSubLogic.kind(data) == BgSubLogic.Kind.ZIP) BgSubLogic.zipSubtitles(data).let { if (it.isNotEmpty()) return it }
+        return libarchive(data)
+    }
+
+    private fun libarchive(data: ByteArray): List<Pair<String, ByteArray>> {
         val out = ArrayList<Pair<String, ByteArray>>()
         var a = 0L
         try {

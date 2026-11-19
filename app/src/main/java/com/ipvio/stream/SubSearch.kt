@@ -75,7 +75,7 @@ object SubSearch {
         try {
             val (name, data) = when (h.provider) {
                 SubSearchLogic.OS -> osFile(h) ?: return@withContext null to osError
-                BgSubLogic.UNACS, BgSubLogic.SAB -> bgFile(h, season, episode) ?: return@withContext null to "Download fehlgeschlagen"
+                BgSubLogic.UNACS, BgSubLogic.SAB -> bgFile(h, season, episode)
                 else -> sdFile(h, season, episode) ?: return@withContext null to "Download fehlgeschlagen"
             }
             val dir = File(c.filesDir, "subs").apply { mkdirs() }
@@ -87,6 +87,8 @@ object SubSearch {
             remember(c, itemId, sub)
             prune(dir)
             sub to null
+        } catch (e: BgFail) {
+            null to (e.message ?: "Download fehlgeschlagen")
         } catch (e: Throwable) {
             null to "Download fehlgeschlagen: " + errName(e)
         }
@@ -137,20 +139,29 @@ object SubSearch {
     /** Marks a hit that is a whole season in one archive ([SubSearchLogic.Hit.format]). */
     private const val PACK = "pack"
 
+    /** The sites filter by the exact year; a playlist year that is one off would find nothing, so the year is optional. */
     private fun unacsRows(title: String, q: SubSearchLogic.Query): Pair<List<BgSubLogic.Row>, String?> {
-        val form = BgSubLogic.unacsForm(title, q.year, q.season, q.episode) ?: return emptyList<BgSubLogic.Row>() to null
-        val (html, err) = page(
-            Request.Builder().url(BgSubLogic.UNACS_SEARCH).header("User-Agent", BROWSER_UA)
-                .header("Referer", BgSubLogic.UNACS_BASE + "/index.php")
-                .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType())).build()
-        )
-        return (html?.let { BgSubLogic.pick(BgSubLogic.unacsRows(it), title, q.year, q.season, q.episode) } ?: emptyList()) to err
+        fun run(year: Int?): Pair<List<BgSubLogic.Row>, String?> {
+            val form = BgSubLogic.unacsForm(title, year, q.season, q.episode) ?: return emptyList<BgSubLogic.Row>() to null
+            val (html, err) = page(
+                Request.Builder().url(BgSubLogic.UNACS_SEARCH).header("User-Agent", BROWSER_UA)
+                    .header("Referer", BgSubLogic.UNACS_BASE + "/index.php")
+                    .post(form.toRequestBody("application/x-www-form-urlencoded".toMediaType())).build()
+            )
+            return (html?.let { BgSubLogic.pick(BgSubLogic.unacsRows(it), title, q.year, q.season, q.episode) } ?: emptyList()) to err
+        }
+        val first = run(q.year)
+        return if (first.first.isEmpty() && first.second == null && q.year != null && !q.isEpisode) run(null) else first
     }
 
     private fun sabRows(title: String, q: SubSearchLogic.Query): Pair<List<BgSubLogic.Row>, String?> {
-        val url = BgSubLogic.sabUrl(title, q.year, q.isEpisode) ?: return emptyList<BgSubLogic.Row>() to null
-        val (html, err) = page(Request.Builder().url(url).header("User-Agent", BROWSER_UA).header("Referer", BgSubLogic.SAB_BASE + "/").build())
-        return (html?.let { BgSubLogic.pick(BgSubLogic.sabRows(it), title, q.year, q.season, q.episode) } ?: emptyList()) to err
+        fun run(year: Int?): Pair<List<BgSubLogic.Row>, String?> {
+            val url = BgSubLogic.sabUrl(title, year, q.isEpisode) ?: return emptyList<BgSubLogic.Row>() to null
+            val (html, err) = page(Request.Builder().url(url).header("User-Agent", BROWSER_UA).header("Referer", BgSubLogic.SAB_BASE + "/").build())
+            return (html?.let { BgSubLogic.pick(BgSubLogic.sabRows(it), title, q.year, q.season, q.episode) } ?: emptyList()) to err
+        }
+        val first = run(q.year)
+        return if (first.first.isEmpty() && first.second == null && q.year != null && !q.isEpisode) run(null) else first
     }
 
     /**
@@ -189,30 +200,74 @@ object SubSearch {
         last
     }
 
-    /** Downloads the archive of [h] and returns the subtitle inside as UTF-8 ("sub.srt" etc.). null = nothing usable. */
-    private fun bgFile(h: SubSearchLogic.Hit, season: Int, episode: Int): Pair<String, ByteArray>? {
-        val (url, referer) = if (h.provider == BgSubLogic.SAB) (BgSubLogic.sabDownload(h.ref) ?: return null) to BgSubLogic.SAB_BASE + "/index.php?"
-        else (BgSubLogic.UNACS_BASE + (BgSubLogic.unacsPath(h.ref) ?: return null)) to BgSubLogic.UNACS_SEARCH
-        val r = Request.Builder().url(url).header("User-Agent", BROWSER_UA).header("Referer", referer).build()
-        val bytes = client.newCall(r).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val b = resp.body ?: return null
-            if (b.contentLength() > MAX_ARCHIVE) return null
-            b.source().let { s -> s.request(MAX_ARCHIVE + 1); if (s.buffer.size > MAX_ARCHIVE) return null; s.buffer.readByteArray() }
+    /** A failure with a reason the person can read (shown in the search panel or as a notice). */
+    private class BgFail(message: String) : Exception(message)
+
+    /**
+     * Bytes of [url]. subsunacs.net and subs.sab.bz send the file only to a request that carries a Referer from the
+     * site, and subsunacs.net sends its details page (not the file) to a request that has none: callers choose.
+     */
+    private fun fetchBytes(url: String, referer: String?, site: String, max: Long): ByteArray {
+        val rb = Request.Builder().url(url).header("User-Agent", BROWSER_UA)
+        if (referer != null) rb.header("Referer", referer)
+        return client.newCall(rb.build()).execute().use { resp ->
+            if (!resp.isSuccessful) throw BgFail("$site: HTTP ${resp.code}")
+            val b = resp.body ?: throw BgFail("$site: empty answer")
+            if (b.contentLength() > max) throw BgFail("$site: file too big")
+            val s = b.source()
+            s.request(max + 1)
+            if (s.buffer.size > max) throw BgFail("$site: file too big")
+            s.buffer.readByteArray()
+        }
+    }
+
+    /**
+     * subsunacs.net: the details page lists the files of the archive and each can be downloaded alone, so no archive is
+     * unpacked. null = the page has no such list (changed markup): the caller falls back to the archive.
+     */
+    private fun unacsEntryFile(h: SubSearchLogic.Hit, season: Int, episode: Int): Pair<String, ByteArray>? {
+        val path = BgSubLogic.unacsPath(h.ref) ?: throw BgFail("SubsUnacs: bad link")
+        val html = String(fetchBytes(BgSubLogic.UNACS_BASE + path, null, "SubsUnacs", 2_000_000), charset(BgSubLogic.PAGE_CHARSET))
+        val left = BgSubLogic.unacsEntries(html).toMutableList()
+        if (left.isEmpty()) return null
+        val total = left.size
+        var tries = 0
+        while (left.isNotEmpty() && tries++ < 3) {
+            val name = BgSubLogic.pickEntry(left.map { it.second }, season, episode, h.format == PACK) ?: break
+            val e = left.removeAt(left.indexOfFirst { it.second == name })
+            val bytes = fetchBytes(BgSubLogic.UNACS_BASE + e.first, null, "SubsUnacs", 4_000_000)
+            BgSubLogic.normalize(name, bytes, h.fps)?.let { return "sub." + it.first to it.second }
+        }
+        throw BgFail("SubsUnacs: no usable subtitle file ($total files listed)")
+    }
+
+    /** Downloads the file of [h] and returns the subtitle as UTF-8 ("sub.srt" etc.). Throws [BgFail] with the reason. */
+    private fun bgFile(h: SubSearchLogic.Hit, season: Int, episode: Int): Pair<String, ByteArray> {
+        val site = if (h.provider == BgSubLogic.SAB) "subs.sab.bz" else "SubsUnacs"
+        if (h.provider != BgSubLogic.SAB) unacsEntryFile(h, season, episode)?.let { return it }
+        val bytes = if (h.provider == BgSubLogic.SAB) {
+            fetchBytes(BgSubLogic.sabDownload(h.ref) ?: throw BgFail("$site: bad link"), BgSubLogic.SAB_BASE + "/", site, MAX_ARCHIVE)
+        } else {
+            fetchBytes(BgSubLogic.UNACS_BASE + (BgSubLogic.unacsPath(h.ref) ?: throw BgFail("$site: bad link")), BgSubLogic.UNACS_SEARCH, site, MAX_ARCHIVE)
         }
         val pack = h.format == PACK
-        if (BgSubLogic.kind(bytes) == BgSubLogic.Kind.PLAIN) {
-            return if (pack) null else BgSubLogic.normalize("sub.srt", bytes, h.fps)?.let { "sub." + it.first to it.second }
+        val kind = BgSubLogic.kind(bytes)
+        if (kind == BgSubLogic.Kind.PLAIN) {
+            if (pack) throw BgFail("$site: season pack is not an archive")
+            return BgSubLogic.normalize("sub.srt", bytes, h.fps)?.let { "sub." + it.first to it.second }
+                ?: throw BgFail("$site: the site sent no subtitle file")
         }
         val files = SubArchive.subtitles(bytes).toMutableList()
+        if (files.isEmpty()) throw BgFail("$site: ${kind.name} archive could not be read")
+        val total = files.size
         // Best entry first; if it is not a text subtitle (e.g. a picture-based .sub), try the next one
         while (files.isNotEmpty()) {
-            val name = BgSubLogic.pickEntry(files.map { it.first }, season, episode, pack) ?: return null
+            val name = BgSubLogic.pickEntry(files.map { it.first }, season, episode, pack) ?: break
             val i = files.indexOfFirst { it.first == name }
             BgSubLogic.normalize(name, files[i].second, h.fps)?.let { return "sub." + it.first to it.second }
             files.removeAt(i)
         }
-        return null
+        throw BgFail("$site: no usable subtitle file in the archive ($total files)")
     }
 
     // ------------------------------------------------------------------ Automatic (Bulgarian)
@@ -225,14 +280,22 @@ object SubSearch {
 
     /**
      * Searches Bulgarian subtitles for [itemId] and downloads the best hit (the next ones if a download fails).
-     * null = already chosen earlier, nothing found, or no connection. Does not touch the player.
+     * Returns the subtitle, or null with a reason to show; null without reason = nothing to do (already chosen earlier or
+     * searched in this app run). Does not touch the player.
      */
-    suspend fun auto(c: Context, itemId: String, q: SubSearchLogic.Query): Sub? {
-        if (q.title.isBlank() || saved(c, itemId) != null || itemId in autoMiss) return null
-        val hits = search(q.copy(langs = listOf("bg"))).hits
-        for (h in hits.take(3)) download(c, itemId, h, q.season, q.episode).first?.let { return it }
+    suspend fun auto(c: Context, itemId: String, q: SubSearchLogic.Query): Pair<Sub?, String?> {
+        if (q.title.isBlank() || saved(c, itemId) != null || itemId in autoMiss) return null to null
+        val r = search(q.copy(langs = listOf("bg")))
+        // A network error is not remembered: the next start searches again
+        if (r.hits.isEmpty()) return null to (r.error ?: "nothing found for \u201e${q.title}\u201c").also { if (r.error == null) autoMiss.add(itemId) }
+        var last: String? = null
+        for (h in r.hits.take(3)) {
+            val (s, err) = download(c, itemId, h, q.season, q.episode)
+            if (s != null) return s to null
+            last = err
+        }
         autoMiss.add(itemId)
-        return null
+        return null to (last ?: "download failed")
     }
 
     // ------------------------------------------------------------------ Per title

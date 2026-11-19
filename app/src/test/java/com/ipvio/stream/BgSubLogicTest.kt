@@ -2,6 +2,7 @@ package com.ipvio.stream
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -167,5 +168,31 @@ class BgSubLogicTest {
         assertEquals("srt", BgSubLogic.normalize("Movie.sub", "{25}{50}Ред\n".toByteArray(charset("windows-1251")), 25.0)!!.first)
         assertNull(BgSubLogic.normalize("Movie.sub", byteArrayOf(0, 0, 1, 0xBA.toByte(), 0x44)))
         assertNull(BgSubLogic.normalize("notes.txt", "Преводът е мой.".toByteArray(charset("windows-1251"))))
+    }
+
+    @Test
+    fun detailsPageEntries() {
+        val html = "<div class=\"rarview\"><label><a href=\"/getentry.php?id=95864&ei=0\">breaking.bad.s01e07.720p.srt</a></label>" +
+            "<label><a href=\"/getentry.php?id=95864&amp;ei=1\">breaking.bad.s01e01.720p.srt</a></label></div>"
+        val e = BgSubLogic.unacsEntries(html)
+        assertEquals(listOf("/getentry.php?id=95864&ei=0" to "breaking.bad.s01e07.720p.srt", "/getentry.php?id=95864&ei=1" to "breaking.bad.s01e01.720p.srt"), e)
+        assertEquals("breaking.bad.s01e01.720p.srt", BgSubLogic.pickEntry(e.map { it.second }, 1, 1, true))
+        assertTrue(BgSubLogic.unacsEntries("<html>nothing</html>").isEmpty())
+    }
+
+    @Test
+    fun zipReading() {
+        val bos = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(bos).use { z ->
+            z.putNextEntry(java.util.zip.ZipEntry("readme.html")); z.write("<html>ad</html>".toByteArray()); z.closeEntry()
+            z.putNextEntry(java.util.zip.ZipEntry("Show.S02E07.1080p.srt"))
+            z.write("1\n00:00:01,000 --> 00:00:02,000\n\u0417\u0434\u0440\u0430\u0432\u0435\u0439\n".toByteArray(charset("windows-1251"))); z.closeEntry()
+        }
+        val files = BgSubLogic.zipSubtitles(bos.toByteArray())
+        assertEquals(listOf("Show.S02E07.1080p.srt"), files.map { it.first })
+        val name = BgSubLogic.pickEntry(files.map { it.first }, 2, 7, true)
+        assertEquals("Show.S02E07.1080p.srt", name)
+        assertNotNull(BgSubLogic.normalize(name!!, files[0].second, 0.0))
+        assertTrue(BgSubLogic.zipSubtitles(ByteArray(50) { 1 }).isEmpty())
     }
 }

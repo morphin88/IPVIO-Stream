@@ -850,7 +850,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
     LaunchedEffect(autoSubKey) {
         if (cur.live || !SubSearch.autoWanted() || SubSearch.saved(ctx, autoSubKey) != null) return@LaunchedEffect
         // Subtitles switched off by hand for this title: leave it that way
-        TrackMemory.get(ctx, cur.itemId)?.let { if (it.second == null) return@LaunchedEffect }
+        TrackMemory.get(ctx, cur.itemId)?.let { if (it.second == null) { notice = "Bulgarian subtitles: off for this title (chosen earlier)"; return@LaunchedEffect } }
         // Wait until the stream plays, so that its own subtitle tracks are known
         var waited = 0
         while (player.playbackState != Player.STATE_READY) { delay(500); waited++; if (waited > 120) return@LaunchedEffect }
@@ -859,8 +859,11 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
         }
         if (own) return@LaunchedEffect
         val q = SubSearchLogic.query(cur.title, cur.tmdbId, cur.season, cur.episode, "bg", "bg")
-        val s = SubSearch.auto(ctx, autoSubKey, q) ?: return@LaunchedEffect
+        notice = "Bulgarian subtitles: searching \u201e${q.title}\u201c \u2026"
+        val (s, why) = SubSearch.auto(ctx, autoSubKey, q)
+        if (s == null) { if (why != null && subKey() == autoSubKey) notice = "Bulgarian subtitles: $why"; return@LaunchedEffect }
         if (subKey() == autoSubKey && SubSearch.attach(player, s)) notice = Lang.tr("Untertitel geladen") + ": " + s.label
+        else if (subKey() == autoSubKey) notice = "Bulgarian subtitles: could not be attached to the stream"
     }
 
     LaunchedEffect(cur.url) {
