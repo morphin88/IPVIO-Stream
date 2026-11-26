@@ -38,13 +38,17 @@ object SubStyle {
     val EDGES = listOf("Kein", "Schatten", "Kontur")
 }
 
-val MENU_LABELS = listOf("Home", "Filme", "Serien", "Live TV", "Suche", "Einstellungen", "EPG", "Favoriten", "Meine Liste", "Verlauf", "Sport")
+val MENU_LABELS = listOf("Home", "Filme", "Serien", "Live TV", "Suche", "Einstellungen", "EPG", "Favoriten", "Meine Liste", "Verlauf", "Sport", "Downloads")
 
 object AppSettings {
     var ipvioFilter by mutableStateOf(false)
+    /** #151: Xtream series that a provider lists season by season are shown as one series. Off by default (it changes the series id). */
+    var mergeSeasons by mutableStateOf(false)
     var gridCols by mutableIntStateOf(4)
     var gridRows by mutableIntStateOf(3)
     var cardW by mutableIntStateOf(150)
+    /** Sort every list opens with: -1 = as before (per tab), otherwise an index from [SORTS]. */
+    var browseSort by mutableIntStateOf(-1)
     var subSize by mutableIntStateOf(1)
     var subColor by mutableIntStateOf(0)
     var subBg by mutableIntStateOf(1)
@@ -93,9 +97,11 @@ object AppSettings {
         val p = prefs(c)
         // Default: provider categories; automatic genres only if chosen (setting or view "Categories")
         ipvioFilter = p.getBoolean("ipvio_filter", false)
+        mergeSeasons = p.getBoolean("merge_seasons", false)
         gridCols = p.getInt("grid_cols", 6).coerceIn(3, 10)
         gridRows = p.getInt("grid_rows", 3).coerceIn(2, 8)
         cardW = p.getInt("card_w", 150).coerceIn(110, 220)
+        browseSort = p.getInt("browse_sort", -1).coerceIn(-1, SORTS.lastIndex)
         subSize = p.getInt("sub_size", 1).coerceIn(0, SubStyle.SIZES.lastIndex)
         subColor = p.getInt("sub_color", 0).coerceIn(0, SubStyle.COLORS.lastIndex)
         subBg = p.getInt("sub_bg", 1).coerceIn(0, SubStyle.BGS.lastIndex)
@@ -222,6 +228,11 @@ object AppSettings {
         init(c)
     }
 
+    fun setMergeSeasons(c: Context, v: Boolean) {
+        mergeSeasons = v
+        prefs(c).edit().putBoolean("merge_seasons", v).apply()
+    }
+
     fun set(c: Context, v: Boolean) {
         ipvioFilter = v
         prefs(c).edit().putBoolean("ipvio_filter", v).apply()
@@ -289,6 +300,12 @@ object AppSettings {
     fun setCardW(c: Context, w: Int) {
         cardW = w.coerceIn(110, 220)
         prefs(c).edit().putInt("card_w", cardW).apply()
+    }
+
+    /** 0..8 = fixed default sort for all lists, -1 = each list keeps its own (as before). */
+    fun setBrowseSort(c: Context, i: Int) {
+        browseSort = i.coerceIn(-1, SORTS.lastIndex)
+        prefs(c).edit().putInt("browse_sort", browseSort).apply()
     }
 
     fun setSub(c: Context, size: Int, color: Int, bg: Int, edge: Int) {
@@ -384,6 +401,14 @@ object Library {
         if (!watch.remove(id)) watch.add(0, id)
         prefs(c).edit().putString("watch", watch.joinToString("\n")).apply()
     }
+
+    /** Reads the lists again after the live sync (W-010b) has written merged data into the file. Main thread. */
+    fun reload(c: Context) {
+        val f = (prefs(c).getString("favs", "") ?: "").split("\n").filter { it.isNotBlank() }
+        val w = (prefs(c).getString("watch", "") ?: "").split("\n").filter { it.isNotBlank() }
+        if (f != favs.toList()) { favs.clear(); favs.addAll(f) }
+        if (w != watch.toList()) { watch.clear(); watch.addAll(w) }
+    }
 }
 
 object QualityStore {
@@ -414,6 +439,7 @@ object History {
     }
 
     fun add(c: Context, id: String) {
+        if (PrivateCats.isPrivateId(id)) return   // private categories are never recorded (T-028)
         ids.remove(id)
         ids.add(0, id)
         while (ids.size > 80) ids.removeAt(ids.lastIndex)
@@ -423,6 +449,19 @@ object History {
     /** Removes a single title from "Recently watched". */
     fun remove(c: Context, id: String) {
         if (!ids.remove(id)) return
+        prefs(c).edit().putString("ids", ids.joinToString("\n")).apply()
+    }
+
+    /** Reads the list again after the live sync (W-010b). Main thread. */
+    fun reload(c: Context) {
+        val l = (prefs(c).getString("ids", "") ?: "").split("\n").filter { it.isNotBlank() }
+        if (l != ids.toList()) { ids.clear(); ids.addAll(l) }
+    }
+
+    /** Removes several titles at once (a category was made private). */
+    fun removeAll(c: Context, remove: Set<String>) {
+        init(c)
+        if (!ids.removeAll { it in remove }) return
         prefs(c).edit().putString("ids", ids.joinToString("\n")).apply()
     }
 }
@@ -449,6 +488,21 @@ object ResumeLog {
         loaded = true
         prefs(c).getString("l", null)?.split('\n')?.filter { it.isNotBlank() }?.let { lines.addAll(it) }
     }
+    /** One log line in the UI language: the time stamp stays, the message is translated (see DictO). */
+    fun display(line: String): String {
+        val i = line.indexOf("  ")
+        return if (i < 0) Lang.tr(line) else line.substring(0, i) + "  " + Lang.tr(line.substring(i + 2))
+    }
+
+    /** Drops lines about these titles (a category was made private). Lines name a title by "#" + the last 4 id characters. */
+    fun removeFor(c: Context, ids: Set<String>) {
+        init(c)
+        val tails = ids.mapTo(HashSet()) { it.takeLast(4) }
+        if (lines.removeAll { l -> TAIL_RE.findAll(l).any { it.groupValues[1] in tails } })
+            prefs(c).edit().putString("l", lines.joinToString("\n")).apply()
+    }
+    private val TAIL_RE = Regex("#([^\\s:]{1,4})")
+
     fun add(c: Context, msg: String) {
         init(c)
         val t = java.text.SimpleDateFormat("dd.MM. HH:mm:ss", java.util.Locale.US).format(java.util.Date())
@@ -464,16 +518,28 @@ object WatchStore {
 
     fun init(c: Context) {
         if (entries.isNotEmpty()) return
-        val s = prefs(c).getString("e", null) ?: return
+        entries.addAll(read(c))
+    }
+
+    private fun read(c: Context): List<Entry> {
+        val s = prefs(c).getString("e", null) ?: return emptyList()
+        val out = ArrayList<Entry>()
         try {
             val a = JSONArray(s)
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
-                entries.add(Entry(o.getString("i"), o.getString("t"), o.getString("u"), o.getLong("p"), o.getLong("d"), o.getLong("ts"),
+                out.add(Entry(o.getString("i"), o.getString("t"), o.getString("u"), o.getLong("p"), o.getLong("d"), o.getLong("ts"),
                     o.optInt("s"), o.optInt("e"), o.optBoolean("n")))
             }
         } catch (e: Exception) {
         }
+        return out
+    }
+
+    /** Reads the entries again after the live sync (W-010b). Main thread. */
+    fun reload(c: Context) {
+        val l = read(c)
+        if (l != entries.toList()) { entries.clear(); entries.addAll(l) }
     }
 
     /**
@@ -481,6 +547,7 @@ object WatchStore {
      * Under 30 seconds nothing changes – a short peek does not delete an old resume point.
      */
     fun save(c: Context, e: Entry, next: Entry? = null) {
+        if (PrivateCats.isPrivateId(e.itemId)) return   // private categories: no resume point, no log line (T-028)
         val fin = ResumeLogic.finished(e.pos, e.dur)
         val old = entries.firstOrNull { it.itemId == e.itemId }
         val what = e.title.take(40) + " #" + e.itemId.takeLast(4) + " " + (e.pos / 1000) + "s/" + (e.dur / 1000) + "s"
@@ -500,6 +567,12 @@ object WatchStore {
     /** Remove from "Continue watching" (menu key on the card). */
     fun remove(c: Context, itemId: String) {
         if (entries.removeAll { it.itemId == itemId }) persist(c)
+    }
+
+    /** Removes several titles at once (a category was made private). */
+    fun removeAll(c: Context, ids: Set<String>) {
+        init(c)
+        if (entries.removeAll { it.itemId in ids }) persist(c)
     }
 
     private fun persist(c: Context) {
@@ -544,7 +617,7 @@ object EpProgress {
 
     @Synchronized
     fun put(c: Context, seriesId: String, season: Int, ep: Int, posMs: Long, durMs: Long) {
-        if (durMs <= 0) return
+        if (durMs <= 0 || PrivateCats.isPrivateId(seriesId)) return
         val m = load(c, seriesId)
         val v = ResumeLogic.EpPos((posMs / 1000).toInt(), (durMs / 1000).toInt())
         val k = ResumeLogic.key(season, ep)
@@ -554,6 +627,29 @@ object EpProgress {
         if (old == v) return
         m[k] = v
         store(c, seriesId, m)
+    }
+
+    /** Number of titles in the progress store (T-031 Trakt sync: new marks only fill free places). */
+    @Synchronized
+    fun count(c: Context): Int = prefs(c).all.size
+
+    /** Size of the progress store: beyond it the oldest titles are forgotten. */
+    fun capacity(): Int = MAX_SERIES
+
+    /**
+     * T-031 Trakt sync: marks [keys] as watched where the title has no progress for them yet. Existing entries (also an
+     * episode the user is in the middle of) are never changed, and a title is only added when the store has room, so no
+     * other title is forgotten for it.
+     */
+    @Synchronized
+    fun addWatched(c: Context, seriesId: String, keys: Collection<Long>) {
+        if (PrivateCats.isPrivateId(seriesId)) return
+        val known = prefs(c).contains(seriesId)
+        if (!known && prefs(c).all.size >= MAX_SERIES) return
+        val m = load(c, seriesId)
+        var changed = false
+        for (k in keys) if (!m.containsKey(k)) { m[k] = ResumeLogic.EpPos(MARK_SECONDS, MARK_SECONDS); changed = true }
+        if (changed) store(c, seriesId, m)
     }
 
     /** Length (seconds) of the placeholder progress that marks an episode as watched by hand. */
@@ -591,6 +687,12 @@ object EpProgress {
     fun clear(c: Context) {
         cache.clear()
         prefs(c).edit().clear().apply()
+    }
+
+    /** Forgets the cached series after the live sync (W-010b) has written merged progress into the file. */
+    @Synchronized
+    fun reload() {
+        cache.clear()
     }
 }
 

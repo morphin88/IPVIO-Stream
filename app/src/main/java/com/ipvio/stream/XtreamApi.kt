@@ -26,7 +26,12 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
      */
     var onTempBytes: (Long) -> Unit = {}
 
-    private fun req(url: String) = Request.Builder().url(url).header("User-Agent", ua).build()
+    private fun req(url: String) = Request.Builder().url(url)
+        .header("User-Agent", ua)
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9,de;q=0.8")
+        .header("Connection", "keep-alive")
+        .build()
 
     private fun text(url: String): String {
         client.newCall(req(url)).execute().use { r ->
@@ -43,6 +48,19 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
         val ok = XtreamLogic.authOk(ui?.opt("auth")?.toString(), ui?.optString("status"))
         if (ok == false) throw PlaylistError("Zugang abgelehnt. Benutzername, Passwort oder Abo prüfen.")
     }
+
+    /** Names of the live categories (small request), to check a list from get.php for completeness. Empty on error. */
+    fun liveCategoryNames(a: XtreamLogic.Acct): Collection<String> = categories(a, "get_live_categories").values
+
+    /** Names of the movie categories (small request), to check a list from get.php for completeness. Empty on error. */
+    fun vodCategoryNames(a: XtreamLogic.Acct): Collection<String> = categories(a, "get_vod_categories").values
+
+    /** Names of the series categories (small request). Empty on error. */
+    fun seriesCategoryNames(a: XtreamLogic.Acct): Collection<String> = categories(a, "get_series_categories").values
+
+    /** Does the provider list movie or series categories (two small requests)? false on error. */
+    fun hasVodCategories(a: XtreamLogic.Acct): Boolean =
+        categories(a, "get_vod_categories").isNotEmpty() || categories(a, "get_series_categories").isNotEmpty()
 
     private fun categories(a: XtreamLogic.Acct, action: String): Map<String, String> {
         val out = HashMap<String, String>()
@@ -83,14 +101,17 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
         return f
     }
 
-    /** Goes through a (large) list entry by entry. If the provider does not answer with a list, nothing happens. */
-    private fun stream(url: String, each: (Map<String, String>) -> Unit) {
+    /**
+     * Goes through a (large) list entry by entry. Return value false = the provider did not answer with a list
+     * (error object, empty body, …) – the caller decides whether that is an error (see [write]).
+     */
+    private fun stream(url: String, each: (Map<String, String>) -> Unit): Boolean {
         client.newCall(req(url)).execute().use { r ->
             if (!r.isSuccessful) throw PlaylistError(PlaylistLogic.httpError(r.code))
-            val body = r.body ?: return
+            val body = r.body ?: return false
             JsonReader(body.charStream()).use { jr ->
                 jr.isLenient = true
-                if (jr.peek() != JsonToken.BEGIN_ARRAY) return
+                if (jr.peek() != JsonToken.BEGIN_ARRAY) return false
                 jr.beginArray()
                 var k = 0
                 while (jr.hasNext()) {
@@ -98,6 +119,7 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
                     if (++k % 1000 == 0) check()
                 }
                 jr.endArray()
+                return true
             }
         }
     }
@@ -184,13 +206,19 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
         return out
     }
 
-    /** Movies as finished lines into [w]; returns their number. */
+    /** Answer without a list where the provider does have categories: the list is incomplete (keep the previous one). */
+    /** [msg] stays a complete German text: it is the translation key (dictionaries). */
+    private fun incomplete(msg: String) = PlaylistError(msg, incomplete = true)
+
+    /** Movies as finished lines into [w]; returns their number. Throws an incomplete error if the film list is missing. */
     private fun writeMovies(a: XtreamLogic.Acct, w: Writer): Int {
         var n = 0
         val vodCats = categories(a, "get_vod_categories")
-        stream(XtreamLogic.api(a, "get_vod_streams")) { f ->
+        val listed = stream(XtreamLogic.api(a, "get_vod_streams")) { f ->
             XtreamLogic.movieEntry(a, f, vodCats)?.let { w.write(it); w.write("\n"); n++ }
         }
+        // The provider lists film categories but delivers no film list: loading would end without any film
+        if (n == 0 && (vodCats.isNotEmpty() || !listed)) throw incomplete("Der Anbieter hat die Filmliste nicht geliefert. Die bisherige Liste bleibt erhalten – bitte später erneut versuchen.")
         check()
         return n
     }
@@ -199,7 +227,8 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
     private fun writeSeries(a: XtreamLogic.Acct, w: Writer): Int {
         val serCats = categories(a, "get_series_categories")
         val series = ArrayList<XtreamLogic.Series>()
-        stream(XtreamLogic.api(a, "get_series")) { f -> XtreamLogic.seriesOf(f, serCats)?.let { series.add(it) } }
+        val listed = stream(XtreamLogic.api(a, "get_series")) { f -> XtreamLogic.seriesOf(f, serCats)?.let { series.add(it) } }
+        if (series.isEmpty() && (serCats.isNotEmpty() || !listed)) throw incomplete("Der Anbieter hat die Serienliste nicht geliefert. Die bisherige Liste bleibt erhalten – bitte später erneut versuchen.")
         for (s in series) { w.write(XtreamLogic.lazyEntry(a, s)); w.write("\n") }
         return series.size
     }
@@ -208,8 +237,10 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
      * Writes the whole list to [out]. Return value: number of entries (channels + movies + series).
      * For series only a placeholder arrives; [LazySeries] fetches the episodes only when a series is opened.
      * Movies and series are fetched at the same time as the channels (into temporary files, appended in the old order):
-     * the three downloads no longer wait for each other, which is the biggest part of the first setup. If the provider refuses
-     * the parallel requests, the missing part is simply fetched again one after the other.
+     * the three downloads do not wait for each other, which is the biggest part of the first setup (restored in 1.4.5,
+     * 1.4.4 loaded them one after the other). Some providers refuse parallel requests (own error codes such as 884/885,
+     * or an error object instead of the list): a part that failed in parallel is fetched again on its own, after the
+     * channels, so such providers still load completely.
      */
     fun write(a: XtreamLogic.Acct, out: Writer): Int {
         onPhase("Zugang wird geprüft …")
@@ -239,16 +270,21 @@ class XtreamApi(private val client: OkHttpClient, private val ua: String) {
 
             onPhase("Sender werden geladen …")
             val liveCats = categories(a, "get_live_categories")
-            stream(XtreamLogic.api(a, "get_live_streams")) { f ->
-                XtreamLogic.liveEntry(a, f, liveCats)?.let { out.write(it); out.write("\n"); n++ }
+            var live = 0
+            val liveList = stream(XtreamLogic.api(a, "get_live_streams")) { f ->
+                XtreamLogic.liveEntry(a, f, liveCats)?.let { out.write(it); out.write("\n"); n++; live++ }
             }
+            if (live == 0 && (liveCats.isNotEmpty() || !liveList)) throw incomplete("Der Anbieter hat die Senderliste nicht geliefert. Die bisherige Liste bleibt erhalten – bitte später erneut versuchen.")
             check()
 
             fun take(f: java.util.concurrent.Future<Int>, file: java.io.File, tmp: java.util.concurrent.atomic.AtomicLong, again: (Writer) -> Int): Int {
                 val count = try { f.get() } catch (e: java.util.concurrent.ExecutionException) {
                     val c = e.cause
-                    // Only a network problem of the parallel request is tried again one by one; abort and login errors pass on
-                    if (c is IOException) fill(file, tmp, again) else throw (c ?: e)
+                    // Cancelled by the user: pass on. Anything else (network, refused parallel request, error object
+                    // instead of the list) is tried once more on its own; if that fails too, its error passes on.
+                    if (c is java.util.concurrent.CancellationException) throw c
+                    check()
+                    fill(file, tmp, again)
                 }
                 // From here the same characters are counted as part of the list: no longer count them as temporary
                 onTempBytes(-tmp.getAndSet(0))

@@ -3,7 +3,8 @@ package com.ipvio.stream
 import java.net.URLEncoder
 
 /** Own error message when loading the playlist (text is meant for the user and never contains the address). */
-class PlaylistError(msg: String) : Exception(msg)
+/** Wrong/failed load. [incomplete] = the provider answered, but a whole part of the list (e.g. all films) is missing. */
+class PlaylistError(msg: String, val incomplete: Boolean = false) : Exception(msg)
 
 /** Validation of playlist inputs and understandable error texts (without Android, testable). */
 object PlaylistLogic {
@@ -54,7 +55,10 @@ object PlaylistLogic {
     }
 
     /** Error text for the user. Never passes on the message of third-party libraries (it can contain address and password). */
-    const val NO_SPACE = "Zu wenig freier Speicherplatz auf dem Gerät. Bitte Platz schaffen (z. B. unbenutzte Apps löschen) und erneut versuchen."
+    /** Memory too small for the list: the add screen then offers "Sprachen wählen" (fewer languages = less memory). */
+    const val TOO_BIG_HINT = "Die Playlist ist zu groß für den Speicher dieses Geräts."
+
+    const val NO_SPACE ="Zu wenig freier Speicherplatz auf dem Gerät. Bitte Platz schaffen (z. B. unbenutzte Apps löschen) und erneut versuchen."
 
     /** Storage full (Android reports this as an IOException with "ENOSPC" or "No space left"). */
     fun noSpace(e: Throwable): Boolean {
@@ -71,6 +75,12 @@ object PlaylistLogic {
         else -> e is java.io.IOException && !noSpace(e)
     }
 
+    /** First place inside the app in the stack trace of [e] (or its cause), e.g. "XtreamApi.kt:104". */
+    fun where(e: Throwable): String? = generateSequence(e) { it.cause }.take(4)
+        .flatMap { it.stackTrace.asSequence() }
+        .firstOrNull { it.className.startsWith("com.ipvio.") && it.fileName != null }
+        ?.let { "${it.fileName}:${it.lineNumber}" }
+
     fun friendlyError(e: Throwable): String = when (e) {
         is PlaylistError -> e.message ?: "Laden fehlgeschlagen."
         is java.net.UnknownHostException -> "Server nicht gefunden. Adresse und Internetverbindung prüfen."
@@ -79,9 +89,10 @@ object PlaylistLogic {
         is javax.net.ssl.SSLPeerUnverifiedException -> "Das Zertifikat des Anbieters passt nicht zur Server-Adresse. Beim Anbieter nach einer aktuellen Adresse fragen."
         is javax.net.ssl.SSLException -> "Sichere Verbindung fehlgeschlagen (Zertifikat)."
         is IllegalArgumentException -> "Ungültige Adresse."
-        is OutOfMemoryError -> "Die Playlist ist zu groß für den Speicher dieses Geräts."
+        is OutOfMemoryError -> TOO_BIG_HINT
         is java.io.IOException -> if (noSpace(e)) NO_SPACE else "Verbindung unterbrochen. Bitte erneut versuchen."
-        else -> "Laden fehlgeschlagen (" + e.javaClass.simpleName + ")."
+        // Unexpected error: name the place in the app (file:line), so a screenshot is enough for a bug report
+        else -> "Laden fehlgeschlagen (" + e.javaClass.simpleName + (where(e)?.let { ", $it" } ?: "") + ")."
     }
 }
 

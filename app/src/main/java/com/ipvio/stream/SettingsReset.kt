@@ -32,11 +32,19 @@ object SettingsReset {
                 PlaybackPrefs.init(ctx)
                 PlaybackPrefs.setQuality(ctx, QualityLogic.AUTO)
                 PlaybackPrefs.setFallback(ctx, true)
+                PlaybackPrefs.setProbe(ctx, true)
+                PlaybackPrefs.setTunneling(ctx, false)
                 DeadLinks.setHide(ctx, false)
             }
             SettingsResetLogic.GENRES -> {
                 IgnoredGroups.init(ctx)
                 IgnoredGroups.clear(ctx)
+                // Everything on again (maintainer, 23 Nov 2026): the categories hidden in the categories view and every
+                // content language too. Before, only the ignored groups were cleared, so hidden categories and switched-off
+                // languages stayed off and the reset looked like it did nothing. Private categories stay private.
+                HiddenCats.showAll(ctx)
+                LangFilter.init(ctx)
+                if (LangFilter.hidden.isNotEmpty()) LangFilter.setAndApply(ctx, emptySet())
             }
             SettingsResetLogic.LIVE -> {
                 LiveSettings.init(ctx)
@@ -44,7 +52,10 @@ object SettingsReset {
                 LiveSettings.setBufferMb(ctx, 512)
                 LiveSettings.setRecDir(ctx, 0)
                 LiveSettings.setRecPad(ctx, 3)
+                LiveSettings.setUpIsNext(ctx, false)
+                LiveSettings.setGenres(ctx, true)
                 Reminders.setLead(ctx, DEFAULT_REMINDER_LEAD_MIN)
+                PlayerButtonPrefs.reset(ctx)
             }
         }
     }

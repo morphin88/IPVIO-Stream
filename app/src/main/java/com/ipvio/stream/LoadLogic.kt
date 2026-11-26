@@ -17,6 +17,36 @@ object LoadLogic {
      */
     const val FACTOR = 0.65
 
+    /**
+     * Address line of a movie or a series episode in an Xtream M3U (get.php): its path contains /movie/ or /series/.
+     * Some providers deliver live channels only through get.php; [hasVod] finds such a list.
+     */
+    fun isVodLine(line: String): Boolean = !line.startsWith("#") && (line.contains("/movie/") || line.contains("/series/"))
+
+    /** Does the list contain at least one movie or series? Stops at the first one. */
+    fun hasVod(lines: Sequence<String>): Boolean = lines.any { isVodLine(it) }
+
+    /** Categories of the movies and of the series in a list, passed through [normGroup] (T-067). */
+    class VodGroups(val movies: Set<String>, val series: Set<String>)
+
+    /** Collects the categories of the movie and series addresses of a list (the group-title of the #EXTINF line before each). */
+    fun vodGroups(lines: Sequence<String>): VodGroups {
+        val movies = HashSet<String>()
+        val series = HashSet<String>()
+        var group: String? = null
+        for (raw in lines) {
+            val l = raw.trim()
+            if (l.startsWith("#EXTINF")) { group = groupTitle(l)?.let { normGroup(it) }; continue }
+            if (l.isEmpty() || l.startsWith("#")) continue
+            val g = group
+            if (g != null) {
+                if (l.contains("/movie/")) movies.add(g) else if (l.contains("/series/")) series.add(g)
+            }
+            group = null
+        }
+        return VodGroups(movies, series)
+    }
+
     /** How many bytes of playlist fit in memory (memory share [SHARE] divided by [FACTOR]). */
     fun budget(maxHeap: Long): Long = (maxHeap * SHARE / FACTOR).toLong()
 
@@ -57,15 +87,19 @@ object LoadLogic {
 
     /**
      * Preselection of the language question: the device's language if the playlist has titles in it, otherwise English.
-     * If neither exists, nothing is preselected. Result = shown languages.
+     * Untagged titles (e.g. 24/7 channels) and the adult bucket are always preselected when present, otherwise they would be
+     * hidden silently on first load. Adult content is still handled by parental control, not by this selection.
+     * If neither a language nor one of these exists, nothing is preselected. Result = shown languages.
      */
     fun systemPreselect(counts: Map<String, Int>, systemLang: String): Set<String> {
         val code = langCodeOf(systemLang)
-        return when {
+        val lang = when {
             (counts[code] ?: 0) > 0 -> setOf(code)
             (counts["en"] ?: 0) > 0 -> setOf("en")
             else -> emptySet()
         }
+        val always = setOf(LangTagLogic.UNKNOWN, LangTagLogic.ADULT).filter { (counts[it] ?: 0) > 0 }
+        return lang + always
     }
 
     // ------------------------------------------------------------------ Resuming (HTTP range)
@@ -178,6 +212,54 @@ object LoadLogic {
         val pass = q["password"] ?: return null
         return Triple(m.groupValues[1], user, pass)
     }
+
+    // ------------------------------------------------------------------ completeness of a download
+
+    /**
+     * End of a downloaded list whose size the server did not send: does it look cut off?
+     * Without a size, a connection the provider closes early (e.g. a time limit on the server) looks like a normal end.
+     * Cut off = the last line is a tag (an entry without its address, e.g. "#EXTINF:-1 group-title=\"AS | …\""), or the file
+     * does not end with a line break and the last line is not an address either (cut in the middle of a line).
+     * A cut in the middle of an address cannot be told from a complete list; [missingCategories] covers Xtream for that.
+     */
+    fun tailLooksCut(tail: String): Boolean {
+        val last = tail.split('\n').map { it.trim('\r', ' ', '\t') }.lastOrNull { it.isNotEmpty() } ?: return false
+        if (last.startsWith("#")) return !last.startsWith("#EXTM3U")
+        val endsWithBreak = tail.endsWith("\n") || tail.endsWith("\r")
+        return !endsWithBreak && !last.contains("://")
+    }
+
+    /** Category of an #EXTINF line (value of group-title), null if there is none. */
+    fun groupTitle(line: String): String? {
+        val at = line.indexOf("group-title=\"")
+        if (at < 0) return null
+        val from = at + 13
+        val end = line.indexOf('"', from)
+        return if (end < 0) null else line.substring(from, end)
+    }
+
+    /** Category names compared without case and surrounding spaces (the API path writes " as '). */
+    fun normGroup(name: String): String = name.replace('"', '\'').trim().lowercase()
+
+    /**
+     * Xtream: are most of the provider's live categories missing from the downloaded list? Then the list arrived only in part.
+     * Providers also list empty categories, so only less than half counts as missing; with fewer than 5 categories nothing is decided.
+     * [found] = categories of the list, already passed through [normGroup].
+     */
+    fun missingCategories(api: Collection<String>, found: Set<String>): Boolean {
+        val names = api.map { normGroup(it) }.filter { it.isNotEmpty() }.toSet()
+        if (names.size < 5) return false
+        val hit = names.count { it in found }
+        return hit * 2 < names.size
+    }
+
+    /**
+     * Xtream: a part (live, movies or series) that failed while it was loaded next to the others is fetched again alone
+     * when the cause was a network error or an incomplete answer (some providers refuse parallel requests).
+     * Everything else (login error, abort) is final.
+     */
+    fun retriesSequentially(cause: Throwable?): Boolean =
+        cause is java.io.IOException || (cause is PlaylistError && cause.incomplete)
 }
 
 /**

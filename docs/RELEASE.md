@@ -38,6 +38,10 @@ Users of an APK signed with a different key have to uninstall once (Settings > S
 
 ## 2. Every release
 
+Since 15 Nov 2026, `.github/workflows/release.yml` does steps 1 to 6 after a merge from `dev` into `main`. It runs the tests first and publishes only if they pass. It refuses to overwrite an existing tag, and it writes `update.json` with the SHA-256 itself. If `docs/release-notes/v<versionName>.md` exists, it is the release text and its first four highlight lines become the `notes` in `update.json`; without it, GitHub lists the merged pull requests and the update dialog shows no notes. The manual steps below are the fallback and still define the file format.
+
+**Required before the first automatic release:** the GitHub secrets `ANDROID_KEYSTORE_BASE64` (base64 of the keystore file), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` must hold the **same key** that signed 1.4.2. A different key means that no user can install the update over the app.
+
 1. In `app/build.gradle.kts` raise `versionCode` (by 1) and `versionName` (e.g. `"1.2"`).
 2. Build the signed APK: `gradlew assembleRelease` (or Build > Generate Signed App Bundle / APK).
    The file is `app/build/outputs/apk/release/app-release.apk`.
@@ -45,7 +49,9 @@ Users of an APK signed with a different key have to uninstall once (Settings > S
 4. Create `update.json` for exactly this APK (section 3).
 5. On GitHub: **Releases > Draft a new release**
    - Tag: `v` + versionName, e.g. `v1.2` (the app compares this tag with its own version)
-   - Title and notes: what is new (the first lines appear in the app)
+   - Title: `IPVIO Stream ` + versionName, e.g. `IPVIO Stream 1.2`
+   - Notes: paste `docs/release-notes/v<versionName>.md` (written from `CHANGELOG.md` with `docs/release-notes/TEMPLATE.md`).
+     If the app falls back to the GitHub API, it shows the first four non-heading lines of this text, so the highlights come first
    - Attach **both** `IPVIO-Stream.apk` and `update.json`
    - **Publish release** (not "pre-release", the app ignores those)
 6. Check: open `https://github.com/Emrodev/IPVIO-Stream/releases/latest/download/update.json` in a browser. It must show your JSON.
@@ -81,14 +87,14 @@ SHA-256 of the APK, so the app can reject a damaged download before the installe
 | `versionName` | Shown to the user; use the same as the tag without `v`. |
 | `apk` | Name of the APK asset in the same release (a full `https://` address also works). |
 | `sha256` | Hash from step 2. **Required** for the built-in source. |
-| `minSupportedCode` | Installed apps with a lower `versionCode` get a required update (no "Später" button). `0` = off. |
+| `minSupportedCode` | Installed apps with a lower `versionCode` get a required update (no "Later" button). `0` = off. |
 | `mandatory` | `true` = this update is required for everybody. Back still closes the dialog, so nobody is locked out. |
 | `notes` | Optional text under the version in the update dialog (max 300 characters). |
 
 4. Attach `update.json` to the release together with the APK (step 5 of section 2).
 
 Rules:
-- **Every time you rebuild the APK, calculate the hash again** and update `versionCode` and `sha256`. A wrong hash makes every user see "Prüfsumme stimmt nicht".
+- **Every time you rebuild the APK, calculate the hash again** and update `versionCode` and `sha256`. A wrong hash makes every user see "Checksum mismatch".
 - Use `"mandatory": true` or `minSupportedCode` only for real emergencies (a broken release). Both are visible to all users.
 - If `update.json` is missing or broken, the app falls back to the GitHub API. That path has **no hash**; the signature check still applies.
 - A custom update address (Settings > App update) may point to an `update.json` without `sha256`; if present it is checked.

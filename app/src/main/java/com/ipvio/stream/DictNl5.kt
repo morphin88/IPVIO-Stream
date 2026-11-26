@@ -490,10 +490,10 @@ Einer groß, drei klein¦Eén groot, drie klein
 OK = Ton hierher, OK lange = Sender wechseln¦OK = geluid hier, OK lang = zender wisselen
 So sieht die Reihenfolge aus¦Zo ziet de volgorde eruit
 Nichts gezeigt¦Niets getoond
-Listen importieren¦Lijsten importeren
+Import & Trakt¦Lijsten importeren
 Letterboxd, MyAnimeList, Trakt¦Letterboxd, MyAnimeList, Trakt
-Hole deine Listen von Letterboxd, MyAnimeList oder Trakt in die App. Die Titel werden mit deiner Playlist abgeglichen: Merkliste und Gesehen werden übernommen.¦Haal je lijsten van Letterboxd, MyAnimeList of Trakt in de app. De titels worden vergeleken met je afspeellijst: kijklijst en gezien worden overgenomen.
-Letterboxd: ZIP oder CSV · MyAnimeList: XML · Trakt: JSON¦Letterboxd: ZIP of CSV · MyAnimeList: XML · Trakt: JSON
+Hole deine Listen von Letterboxd, MyAnimeList in die App. Die Titel werden mit deiner Playlist abgeglichen: Merkliste und Gesehen werden übernommen.¦Haal je lijsten van Letterboxd, MyAnimeList in de app. De titels worden vergeleken met je afspeellijst: kijklijst en gezien worden overgenomen.
+Letterboxd: ZIP oder CSV · MyAnimeList: XML¦Letterboxd: ZIP of CSV · MyAnimeList: XML
 Dieses Gerät hat keinen sicheren Schlüsselspeicher: Playlist-Adressen mit Zugangsdaten werden unverschlüsselt gespeichert.¦Dit apparaat heeft geen veilige sleutelopslag: playlist-adressen met inloggegevens worden onversleuteld opgeslagen.
 Datei vom Gerät wählen¦Bestand van apparaat kiezen
 Auf diesem Gerät gibt es keine Dateiauswahl. Nutze den Import im WLAN.¦Dit apparaat heeft geen bestandskiezer. Gebruik de wifi-import.
@@ -627,4 +627,12 @@ TD¦DS
 OTN¦VNV
 Serie¦Reeks
 J.¦jr
+# API keys by phone and subtitle search (release 1.4.2)
+Am Handy eingeben¦Op telefoon invoeren
+Schlüssel vom Handy erhalten und gespeichert. Jetzt „Speichern und prüfen“ drücken.¦Sleutel van je telefoon ontvangen en opgeslagen. Druk nu op “Opslaan en controleren”.
+Eingabe am Handy beenden¦Invoer via telefoon stoppen
+Untertitel online suchen¦Ondertitels online zoeken
+Kostenlos unter subdl.com > Konto > API. Im Player unter „Audio & Untertitel“ > „Untertitel online suchen“ werden beide Dienste gefragt.¦Gratis op subdl.com > Account > API. In de speler onder “Audio & ondertitels” > “Ondertitels online zoeken” worden beide diensten bevraagd.
+Keine Untertitel in den gewünschten Sprachen¦Geen ondertitels in de gewenste talen
+Kein Schlüssel für die Untertitel-Suche. Einstellungen > API-Schlüssel¦Geen sleutel voor het zoeken naar ondertitels. Instellingen > API-sleutels
 """

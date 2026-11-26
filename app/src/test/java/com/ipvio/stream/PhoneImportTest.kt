@@ -128,4 +128,20 @@ class PhoneImportTest {
         assertTrue(PhoneImportLogic.page(1).contains("Send to TV"))
         assertTrue(PhoneImportLogic.message(7, "ok").contains("Envoyé"))
     }
+
+    @Test fun vpnSectionOnlyWhenTheTvOffersIt() {
+        assertFalse(PhoneImportLogic.page(1).contains("id=\"vf\""))
+        val withVpn = PhoneImportLogic.page(1, PhoneImportLogic.Features(vpn = true))
+        assertTrue(withVpn.contains("id=\"vf\""))
+        assertTrue(withVpn.contains("fetch('/vpn?code="))
+        assertTrue(withVpn.contains("WireGuard configuration (VPN)"))
+    }
+
+    @Test fun uploadScriptsAreClosed() {
+        // A missing closing brace left the upload functions undefined: tapping "Upload" did nothing (playlist file, list, VPN)
+        val page = PhoneImportLogic.page(1, PhoneImportLogic.Features(true, true, true, true, true, true, true))
+        val scripts = Regex("<script>(.*?)</script>", RegexOption.DOT_MATCHES_ALL).findAll(page).map { it.groupValues[1] }.toList()
+        assertTrue(scripts.isNotEmpty())
+        for (js in scripts) assertEquals(js.count { it == '{' }, js.count { it == '}' })
+    }
 }

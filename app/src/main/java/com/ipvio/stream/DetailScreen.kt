@@ -45,13 +45,14 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import java.net.URLEncoder
 
 fun openTrailer(ctx: Context, key: String?, title: String) {
-    val uri = if (key != null) "https://www.youtube.com/watch?v=$key"
-    else "https://www.youtube.com/results?search_query=" + URLEncoder.encode("$title Trailer", "UTF-8")
+    val i = Intent(Intent.ACTION_VIEW, Uri.parse(TrailerLogic.externalUrl(key, title))).addFlags(Intent.FLAG_ACTIVITY_NO_USER_ACTION)
+    // From an activity the trailer app starts in the app's own task, so Back returns to the detail page;
+    // a new task is only needed when the context is not an activity
+    if (ctx !is android.app.Activity) i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     try {
-        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_USER_ACTION))
+        ctx.startActivity(i)
     } catch (e: Exception) {
         Toast.makeText(ctx, Lang.tr("Keine App zum Öffnen des Trailers gefunden"), Toast.LENGTH_LONG).show()
     }
@@ -147,8 +148,10 @@ private fun DetailScreenFull(
     BackHandler(enabled = !embedded, onBack = onBack)
     var meta by remember(item.id) { mutableStateOf(MetaRepo.cached(item)) }
     var metaDone by remember(item.id) { mutableStateOf(!MetaRepo.usable(item) || item.kind == Kind.LIVE) }
-    LaunchedEffect(item.id) {
-        MetaRepo.extended(ctx, item)?.let { meta = it }
+    // The age rating is fetched for older stored details only on the real detail page, not in the list preview (1.4.5)
+    val needAge = !embedded || showActions
+    LaunchedEffect(item.id, needAge) {
+        MetaRepo.extended(ctx, item, needAge = needAge)?.let { meta = it }
         metaDone = true
     }
     val credits by produceState<Credits?>(null, meta?.tmdbId) {
@@ -195,7 +198,7 @@ private fun DetailScreenFull(
     val qCap = remember { PlaybackPrefs.cap(ctx) }
     fun pick(ep: Episode) = pickVariant(ep, prefQ, prefLang, prefLabel, qCap)
     val playUrl = if (item.kind == Kind.SERIES) eps.firstOrNull()?.let { pick(it).url }
-        else movieVars.firstOrNull { it.label == prefLabel }?.url ?: item.url
+        else DownloadStore.localUrlFor(ctx, item) ?: (movieVars.firstOrNull { it.label == prefLabel }?.url ?: item.url)
 
     val tmdbId = meta?.tmdbId
     val imdbId = meta?.imdbId
@@ -451,6 +454,8 @@ private fun DetailScreenFull(
                         Text(raw = true, text = item.title, color = Tok.TextHi, fontSize = spx(84), lineHeight = spx(84), fontWeight = FontWeight.ExtraBold,
                             letterSpacing = (-1.5).sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         HeroMetaLine(item, meta, dots = false)
+                        // Tracks of the file read from its header (T-033, issue #24); series: first episode of the shown season
+                        if (showActions && item.kind != Kind.LIVE && !DemoMode.active) playUrl?.let { ProbeLine(it) }
                         // Movie started: small progress bar with remaining time
                         if (item.kind != Kind.SERIES && resume != null && resume.dur > 0 && !ResumeLogic.finished(resume.pos, resume.dur)) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(dpx(10))) {
@@ -521,11 +526,21 @@ private fun DetailScreenFull(
                                 // Round 14: movies and series as favorites (appear under "Favorites")
                                 val fav = Library.isFav(item.id)
                                 HeroButton(if (fav) "Favorit" else "Zu Favoriten", if (fav) AIcon.HeartFilled else AIcon.Heart, false, Modifier, bh) { Library.toggleFav(ctx, item.id) }
-                                HeroButton("Trailer", AIcon.Play, false, Modifier, bh) { openTrailer(ctx, meta?.trailerKey, item.title) }
+                                HeroButton("Trailer", AIcon.Play, false, Modifier, bh) {
+                                    // T-032: opens YouTube at once (the in-app player showed no picture on test devices)
+                                    openTrailer(ctx, meta?.trailerKey, item.title)
+                                }
                                 HeroButton("Extern", AIcon.External, false, Modifier, bh) { playUrl?.let { openExternal(ctx, it, item.title) } }
+                                // T-052a: download of a movie file (step 1)
+                                playUrl?.let { VodDownloadButton(item, it, bh) }
+                                // T-052a / T-055: every episode of the shown season goes into the download queue (best quality each).
+                                // Shown for every series, also before the first play (it was only inside the resume branch).
+                                if (item.kind == Kind.SERIES && eps.isNotEmpty()) SeasonDownloadButton(item, eps, { ep -> pick(ep).url }, bh)
                             }
                             // Watched by hand: movie, season, whole series (also reachable per episode: long OK / menu key on the row)
                             Row(horizontalArrangement = Arrangement.spacedBy(dpx(12))) {
+                                // Own row for the episode picker: the top row is already full and cut off the button
+                                if (item.kind == Kind.SERIES && eps.isNotEmpty()) EpisodePickButton(item, eps, { ep -> pick(ep).url }, bh)
                                 // A finished resume point would otherwise keep offering "Continue"
                                 fun dropResume(keys: Collection<Long>) {
                                     if (resume == null) return
@@ -535,19 +550,31 @@ private fun DetailScreenFull(
                                 if (item.kind == Kind.SERIES) {
                                     val seasonKeys = eps.map { ResumeLogic.key(it.season, it.num) }
                                     val seasonSeen = seasonKeys.isNotEmpty() && seasonKeys.all { progress[it]?.done == true }
-                                    HeroButton(if (seasonSeen) "Staffel zurücksetzen" else "Staffel gesehen", if (seasonSeen) AIcon.Rewind else AIcon.Check, false, Modifier, bh) {
+                                    val allKeys = item.episodes.map { ResumeLogic.key(it.season, it.num) }
+                                    val allSeen = allKeys.isNotEmpty() && allKeys.all { progress[it]?.done == true }
+                                    fun toggleSeason() {
                                         EpProgress.mark(ctx, item.id, seasonKeys, !seasonSeen)
                                         if (!seasonSeen) dropResume(seasonKeys)
                                         progVer++
                                     }
+                                    fun toggleAll() {
+                                        EpProgress.mark(ctx, item.id, allKeys, !allSeen)
+                                        if (!allSeen) dropResume(allKeys)
+                                        progVer++
+                                    }
                                     if (seasons.size > 1) {
-                                        val allKeys = item.episodes.map { ResumeLogic.key(it.season, it.num) }
-                                        val allSeen = allKeys.isNotEmpty() && allKeys.all { progress[it]?.done == true }
-                                        HeroButton(if (allSeen) "Serie zurücksetzen" else "Serie gesehen", if (allSeen) AIcon.Rewind else AIcon.Check, false, Modifier, bh) {
-                                            EpProgress.mark(ctx, item.id, allKeys, !allSeen)
-                                            if (!allSeen) dropResume(allKeys)
-                                            progVer++
-                                        }
+                                        // One button for both cases: it opens a small choice (this season or the whole series)
+                                        var watchedOpen by remember { mutableStateOf(false) }
+                                        HeroButton("Gesehen", AIcon.Check, false, Modifier, bh) { watchedOpen = true }
+                                        if (watchedOpen) WatchedChoiceDialog(
+                                            seasonLabel = if (seasonSeen) "Staffel zurücksetzen" else "Staffel gesehen",
+                                            allLabel = if (allSeen) "Serie zurücksetzen" else "Serie gesehen",
+                                            onSeason = { toggleSeason(); watchedOpen = false },
+                                            onAll = { toggleAll(); watchedOpen = false },
+                                            onClose = { watchedOpen = false }
+                                        )
+                                    } else {
+                                        HeroButton(if (seasonSeen) "Staffel zurücksetzen" else "Staffel gesehen", if (seasonSeen) AIcon.Rewind else AIcon.Check, false, Modifier, bh) { toggleSeason() }
                                     }
                                 } else if (item.kind == Kind.MOVIE) {
                                     val k = ResumeLogic.key(0, 0)
@@ -712,7 +739,13 @@ private fun DetailScreenFull(
                                         if (!seen && resumeSE?.let { ResumeLogic.key(it.first, it.second) } == k) WatchStore.remove(ctx, item.id)
                                         progVer++
                                     }
-                                ) { onPlay(v.url, item.title + " S" + ep.season + "E" + ep.num, 0L) }
+                                    , dlState = DownloadStore.progress[DownloadLogic.keyFor(episodeDownloadItem(item, ep))],
+                                    onMenu = { startEpisodeDownload(ctx, item, ep, v.url) }
+                                ) {
+                                    // a finished download plays from the device, otherwise the stream as before
+                                    val local = DownloadStore.localUrlFor(ctx, episodeDownloadItem(item, ep))
+                                    onPlay(local ?: v.url, item.title + " S" + ep.season + "E" + ep.num, 0L)
+                                }
                             }
                         }
                     }
@@ -733,8 +766,23 @@ private fun DetailScreenFull(
     }
 }
 
+/** "Watched" choice of a series with several seasons: this season or the whole series. Each toggles its own state. */
 @Composable
-private fun EpisodeRow(ep: Episode, em: EpMeta?, v: Variant, prog: ResumeLogic.EpPos?, modifier: Modifier, onFocus: () -> Unit, onToggleSeen: () -> Unit, onClick: () -> Unit) {
+private fun WatchedChoiceDialog(seasonLabel: String, allLabel: String, onSeason: () -> Unit, onAll: () -> Unit, onClose: () -> Unit) {
+    androidx.compose.ui.window.Dialog(onDismissRequest = onClose) {
+        Column(
+            Modifier.width(560.dp).clip(RoundedCornerShape(DS.RadiusL)).background(Tok.GlassStrong).padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PillButton(seasonLabel, light = true) { onSeason() }
+            PillButton(allLabel, light = true) { onAll() }
+            PillButton("Abbrechen") { onClose() }
+        }
+    }
+}
+
+@Composable
+private fun EpisodeRow(ep: Episode, em: EpMeta?, v: Variant, prog: ResumeLogic.EpPos?, modifier: Modifier, onFocus: () -> Unit, onToggleSeen: () -> Unit, dlState: Int? = null, onMenu: (() -> Unit)? = null, onClick: () -> Unit) {
     var f by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(dpx(16))
     // Round 17b: the selected episode floats forward (glass, shadow, slightly larger) instead of a white frame; the others stay calm
@@ -747,6 +795,8 @@ private fun EpisodeRow(ep: Episode, em: EpMeta?, v: Variant, prog: ResumeLogic.E
             .border(1.dp, if (f) Color(0x33FFFFFF) else Color.Transparent, shape)
             .onFocusChanged { f = it.isFocused; if (it.isFocused) onFocus() }
             .favKeys(onToggleSeen)
+            // T-052a: menu key starts the download of this episode
+            .then(if (onMenu != null) Modifier.onPreviewKeyEvent { ev -> if (ev.type == KeyEventType.KeyDown && ev.key == Key.Menu) { onMenu(); true } else false } else Modifier)
             .clickable(onClick = onClick)
             .padding(dpx(14)),
         horizontalArrangement = Arrangement.spacedBy(dpx(22)), verticalAlignment = Alignment.CenterVertically
@@ -776,6 +826,9 @@ private fun EpisodeRow(ep: Episode, em: EpMeta?, v: Variant, prog: ResumeLogic.E
                 em?.imdb?.let { Badge("IMDb $it", Color(0xFFF5C518), Color.Black) }
                 if (em?.imdb == null) em?.rating?.let { RatingBadge(it, Color(0x26FFFFFF)) }
                 em?.runtime?.let { Badge("$it Min") }
+                // T-052a: download state of the episode
+                if (dlState == DownloadStore.DONE) Badge("Heruntergeladen", DS.Scrim, Accent2)
+                else if (dlState != null && dlState >= 0) Badge(Lang.tr("Lädt {0} %").replace("{0}", dlState.toString()), DS.Scrim, Accent2)
             }
             em?.air?.let { Text(raw = true, text = it, color = Muted, fontSize = spx(16)) }
             em?.overview?.let { Text(raw = true, text = it, color = if (f) Tok.TextMid else Tok.TextLow, fontSize = spx(18), lineHeight = spx(25), maxLines = 3, overflow = TextOverflow.Ellipsis) }

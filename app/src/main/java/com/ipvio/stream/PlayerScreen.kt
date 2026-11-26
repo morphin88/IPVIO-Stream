@@ -92,6 +92,7 @@ import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collectLatest
 
 data class PlayReq(
@@ -117,7 +118,7 @@ private const val STALKER_NO_ADDRESS = "Das Portal hat keine Abspiel-Adresse gel
 
 private val SLEEP_MIN = listOf(0, 15, 30, 45, 60, 90, 120)
 
-private enum class Panel { NONE, TRACKS, SUBSEARCH, SUBSTYLE, QUALITY, SPEED, ASPECT, MENU, STEP, EPISODES, SLEEP, ARCHIVE, CLOCK }
+private enum class Panel { NONE, TRACKS, SUBSEARCH, SUBSTYLE, QUALITY, SPEED, ASPECT, MENU, STEP, EPISODES, SLEEP, ARCHIVE, CLOCK, SUBDELAY, AVDELAY }
 
 private class Flash(val icon: PIcon?, val text: String?)
 
@@ -157,13 +158,15 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(10_000)
             .setReadTimeoutMs(15_000)
-        ExoPlayer.Builder(ctx, SoftAudio.factory(ctx))
+        // W-005/W-007: renderers wrapped for the subtitle and audio delay (no change while both are 0)
+        ExoPlayer.Builder(ctx, PlayerSync.wrap(SoftAudio.factory(ctx)))
             .setLoadControl(Mem.loadControl(ctx))
             .setWakeMode(C.WAKE_MODE_NETWORK)
             // "tap://" = live buffer on the device (rewind, recording), everything else as before
             .setMediaSourceFactory(
-                DefaultMediaSourceFactory(ctx)
-                    .setDataSourceFactory(TapAwareDataSource.Factory(HostFailover.DataSourceWrapper.Factory(DefaultDataSource.Factory(ctx, http))))
+                // MKV files without a Cues index stay seekable (#10, see CuelessMkvExtractor)
+                DefaultMediaSourceFactory(ctx, CuelessMkvExtractor.Factory())
+                    .setDataSourceFactory(TapAwareDataSource.Factory(DownloadStore.playbackFactory(ctx, HostFailover.DataSourceWrapper.Factory(DefaultDataSource.Factory(ctx, http)))))
                     // Short network hiccups are retried inside the player (several times) instead of ending in an error
                     .setLoadErrorHandlingPolicy(IptvLoadErrorPolicy())
             )
@@ -174,14 +177,17 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
             }
     }
     val h = remember { Handler(Looper.getMainLooper()) }
-    // State for keeping the screen awake: applies only while really playing or buffering
-    // (not when paused, ended, on error or in the background). Otherwise the screensaver starts after about 5 minutes.
+    // State for keeping the screen awake: applies while playing, buffering or paused by the user
+    // (not after the sleep timer, at the end, on error or in the background).
     var pWhenReady by remember { mutableStateOf(true) }
+    var sleepExpired by remember { mutableStateOf(false) }
     var pState by remember { mutableIntStateOf(Player.STATE_IDLE) }
     var pError by remember { mutableStateOf(false) }
     var foreground by remember { mutableStateOf(true) }
-    KeepScreenOn("player", AwakeLogic.playerNeedsScreen(pWhenReady, pState, pError, foreground))
+    KeepScreenOn("player", AwakeLogic.playerNeedsScreen(pWhenReady, pState, pError, foreground, sleepExpired))
     var cur by remember { mutableStateOf(req) }
+    // W-005: the subtitle delay applies to one title only
+    LaunchedEffect(cur.itemId, cur.season, cur.episode) { PlayerSync.resetSub() }
     var zapSrc by remember { mutableStateOf(zapList) }
     var msg by remember { mutableStateOf<String?>(null) }
     var buffering by remember { mutableStateOf(true) }
@@ -226,6 +232,8 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
     var sleepIdx by remember { mutableIntStateOf(0) }
     var sleepAt by remember { mutableLongStateOf(0L) }
     var aspect by remember { mutableIntStateOf(General.defaultAspect) }
+    // Display aspect ratio of the current video (width × pixel ratio / height), 0 = not known yet (issue 10)
+    var videoAr by remember { mutableStateOf(0f) }
     var interact by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var flash by remember { mutableStateOf<Flash?>(null) }
     var info by remember { mutableStateOf<String?>(null) }
@@ -278,6 +286,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
     val guideFocus = remember { FocusRequester() }
     val seekFocus = remember { FocusRequester() }
     val liveFirst = remember { FocusRequester() }
+    remember { PlayerButtonPrefs.init(ctx); 0 }   // T-062: chosen buttons of the live controls
     val playBtn = remember { FocusRequester() }
     val btn = remember { Panel.entries.associateWith { FocusRequester() } }
 
@@ -430,6 +439,14 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
         return true
     }
 
+    /** #146: tunneled playback for Live TV when the user switched it on (the player falls back by itself if the device cannot). */
+    fun applyTunneling() {
+        val want = TunnelingLogic.wanted(PlaybackPrefs.tunneling, cur.live, second != null)
+        (player.trackSelectionParameters as? androidx.media3.exoplayer.trackselection.DefaultTrackSelector.Parameters)?.let {
+            if (it.tunnelingEnabled != want) player.trackSelectionParameters = it.buildUpon().setTunnelingEnabled(want).build()
+        }
+    }
+
     /** Audio and subtitles according to settings and the remembered choice for this title. */
     fun applyTrackPrefs() {
         val mem = TrackMemory.get(ctx, cur.itemId)
@@ -439,6 +456,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
         (player.trackSelectionParameters as? androidx.media3.exoplayer.trackselection.DefaultTrackSelector.Parameters)?.let {
             player.trackSelectionParameters = it.buildUpon().setConstrainAudioChannelCountToDeviceCapabilities(false).build()
         }
+        applyTunneling()
         var p = player.trackSelectionParameters.buildUpon()
         val audios = TrackLogic.audioPrefs(AppSettings.audioLang, AppSettings.audioLang2, mem?.first)
         p = p.setPreferredAudioLanguages(*audios.toTypedArray())
@@ -592,18 +610,32 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
     val archNext = cur.archive?.let { a -> CatchupLogic.neighbour(archProg, a.prog.start, 1)?.takeIf { Catchup.canPlay(curItem, it, archNow) } }
 
     /** Play a show from the channel's archive [ch] (including the running one from the beginning). */
-    fun playArchive(ch: Item, e: EpgEntry) {
+    fun playArchive(ch: Item, e: EpgEntry, startMs: Long = 0L) {
         val url = Catchup.urlFor(ch, e)
         if (url == null) { flash = Flash(null, "Nicht im Archiv verfügbar"); return }
         if (cur.live && cur.itemId != ch.id) lastChId = cur.itemId
         scrubTarget = -1L
-        cur = PlayReq(e.title, url, ch.id, false, 0L, archive = ArchiveRef(ch.id, ch.title, e))
+        cur = PlayReq(e.title, url, ch.id, false, startMs, archive = ArchiveRef(ch.id, ch.title, e))
         showGuide = false
         showChannels = false
         showCats = false
         panel = Panel.NONE; panelParent = Panel.NONE
         controls = false
         flash = Flash(null, dayLabel(e.start) + "  " + hhmm(e.start))
+    }
+
+    /**
+     * T-062: rewind on a live catch-up channel (no local buffer): the seek step back, through the archive. The show on air at
+     * that time is played from its start and then moved to the offset (the server takes the start only to the minute).
+     */
+    fun rewindLive() {
+        val ch = curItem ?: return
+        scope.launch {
+            val now = System.currentTimeMillis() / 1000
+            val pick = CatchupSeekLogic.pick(EpgFull.get(ch), CatchupSeekLogic.target(now, step / 1000))
+            if (pick == null || !Catchup.canPlay(ch, pick.show, now)) flash = Flash(null, "Nicht im Archiv verfügbar")
+            else playArchive(ch, pick.show, pick.offsetSec * 1000L)
+        }
     }
 
     /** From the archive back to the live picture of the same channel. */
@@ -704,7 +736,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
             override fun onPlayerError(e: PlaybackException) {
                 pError = true
                 val status = httpStatusOf(e)
-                Diag.report("Wiedergabe: " + e.errorCodeName + (if (status > 0) " (HTTP $status)" else ""))
+                Diag.report("Playback: " + e.errorCodeName + (if (status > 0) " (HTTP $status)" else ""))
                 val decoder = e.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
                     e.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
                     e.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED ||
@@ -762,7 +794,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                 if (reason == Player.DISCONTINUITY_REASON_SEEK || reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT) lastSeekT = System.currentTimeMillis()
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }
-            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) { pWhenReady = playWhenReady }
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) { pWhenReady = playWhenReady; if (playWhenReady) sleepExpired = false }
             override fun onTracksChanged(tracks: Tracks) {
                 tracksVer++
                 ensureAudio()
@@ -770,7 +802,10 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                 val vf = player.videoFormat
                 if (vf != null) showInfo(vf.width, vf.height)
             }
-            override fun onVideoSizeChanged(videoSize: VideoSize) { showInfo(videoSize.width, videoSize.height) }
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) videoAr = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                showInfo(videoSize.width, videoSize.height)
+            }
         }
         player.addListener(l)
         applyTrackPrefs()
@@ -785,6 +820,8 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
             saveProgress()
             h.removeCallbacksAndMessages(null)
             player.removeListener(l)
+            // Stop first: the sound ends at once, even if the release takes a moment (T-051)
+            runCatching { player.stop() }
             player.release()
             // Release the buffer (a running recording keeps holding it)
             LiveTimeshift.stop()
@@ -1008,6 +1045,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
         if (sleepAt > 0L) {
             delay((sleepAt - System.currentTimeMillis()).coerceAtLeast(0L))
             if (sleepAt > 0L) {
+                sleepExpired = true   // the screen is released again (a plain pause keeps it on)
                 player.pause()
                 sleepAt = 0L; sleepIdx = 0
                 flash = Flash(PIcon.Pause, "Sleep-Timer")
@@ -1030,6 +1068,8 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
         triedUrls.clear()
         applyTrackPrefs()
     }
+    // #146: a second picture switches tunneling off, closing it switches it on again
+    LaunchedEffect(second != null, cur.live, PlaybackPrefs.tunneling) { applyTunneling() }
     LaunchedEffect(notice) { if (notice != null) { delay(5000); notice = null } }
     LaunchedEffect(digitBuf) {
         if (digitBuf.isNotEmpty()) { delay(1800); commitDigits() }
@@ -1079,6 +1119,10 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                     k == Key.MediaFastForward && cur.live && LiveTimeshift.active -> { LiveTimeshift.seekBy(player, step); flash = Flash(PIcon.Forward, "+" + step / 1000 + " s"); true }
                     k == Key.MediaNext && cur.live -> { zap(1); true }
                     k == Key.MediaPrevious && cur.live -> { zap(-1); true }
+                    // Remote channel keys P+ / P- (e.g. Sony PROG): next / previous channel. The "Up goes to the next channel"
+                    // setting only affects Up / Down.
+                    k == Key.ChannelUp && cur.live -> { zap(1); true }
+                    k == Key.ChannelDown && cur.live -> { zap(-1); true }
                     k == Key.MediaNext && cur.archive != null -> { val ch = curItem; val nx = archNext; if (ch != null && nx != null) playArchive(ch, nx) else backToLive(); true }
                     k == Key.MediaPrevious && cur.archive != null -> { val ch = curItem; val pv = archPrev; if (ch != null && pv != null) playArchive(ch, pv); true }
                     k == Key.MediaNext && !cur.live && hasNext -> { playEpisode(epList[epIdx + 1]); true }
@@ -1128,8 +1172,8 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                                 true
                             }
                         }
-                        Key.DirectionUp -> { if (cur.live) zap(-1) else { focusSeek = true; controls = true }; true }
-                        Key.DirectionDown -> { if (cur.live) zap(1) else { focusSeek = false; controls = true }; true }
+                        Key.DirectionUp -> { if (cur.live) zap(LiveKeyLogic.zapStep(up = true, upIsNext = LiveSettings.upIsNext)) else { focusSeek = true; controls = true }; true }
+                        Key.DirectionDown -> { if (cur.live) zap(LiveKeyLogic.zapStep(up = false, upIsNext = LiveSettings.upIsNext)) else { focusSeek = false; controls = true }; true }
                         Key.Menu -> { focusSeek = false; controls = true; true }
                         else -> false
                     }
@@ -1152,8 +1196,17 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                 }
             }
             5 -> Modifier.align(Alignment.Center).fillMaxHeight().aspectRatio(4f / 3f)
+            // Issue 10: fit / crop / stretch are laid out here from the real video aspect ratio instead of relying on the resize
+            // mode of the player view (which showed no difference); the view then only fills the area it gets
+            in 0..2 -> if (videoAr > 0f) Modifier.fillMaxSize().layout { m, c ->
+                val (w, hh) = AspectLogic.box(am, videoAr, c.maxWidth, c.maxHeight)
+                val pl = m.measure(androidx.compose.ui.unit.Constraints.fixed(w, hh))
+                layout(c.maxWidth, c.maxHeight) { pl.place((c.maxWidth - w) / 2, (c.maxHeight - hh) / 2) }
+            } else Modifier.fillMaxSize()
             else -> Modifier.fillMaxSize()
         }
+        // Area sized by the layout above: the view fills it exactly
+        val sized = !showGuide && am in 0..2 && videoAr > 0f
         AndroidView(
             factory = { c ->
                 PlayerView(c).apply {
@@ -1164,10 +1217,10 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
             },
             update = { v ->
                 // apply only if something really changed (saves work on every redraw)
-                val styleKey = "$am|${AppSettings.subSize}|${AppSettings.subColor}|${AppSettings.subBg}|${AppSettings.subEdge}"
+                val styleKey = "$am|$sized|${AppSettings.subSize}|${AppSettings.subColor}|${AppSettings.subBg}|${AppSettings.subEdge}"
                 if (v.tag != styleKey) {
                     v.tag = styleKey
-                    v.resizeMode = when (am) {
+                    v.resizeMode = if (sized) AspectRatioFrameLayout.RESIZE_MODE_FILL else when (am) {
                         1 -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                         2, 5 -> AspectRatioFrameLayout.RESIZE_MODE_FILL
                         else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -1407,96 +1460,115 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                             },
                             horizontalArrangement = Arrangement.spacedBy(PT.BtnGap), verticalAlignment = Alignment.CenterVertically
                         ) {
-                            PRoundButton(Modifier.focusRequester(liveFirst), label = "Senderliste", onLabel = setLabel, onClick = { openChannels() }) {
-                                PlayerIcon(PIcon.Channels, it)
+                            // T-062: rewind and fast-forward first (fixed, only where they can work), then the buttons chosen in
+                            // Settings > Live TV, "Settings" last. The channel list and the TV guide are on Left and Right.
+                            val canBuf = LiveTimeshift.active
+                            val hasCatchup = Catchup.has(curItem)
+                            val seekBtn = canBuf || (hasCatchup && cur.archive == null)
+                            val liveStepS = (step / 1000).toString()
+                            val canRec = cur.archive == null && TapLogic.tappable(resolvedUrl.ifEmpty { cur.url })
+                            val shownIds = PlayerButtonPrefs.live.filter { id ->
+                                when (id) {
+                                    PlayerButtonsLogic.REC -> canRec
+                                    PlayerButtonsLogic.FROMSTART, PlayerButtonsLogic.ARCHIVE -> hasCatchup
+                                    PlayerButtonsLogic.QUALITY -> liveAlts.size > 1
+                                    PlayerButtonsLogic.SCORE -> SportAlerts.miniOn || SportAlerts.pinned.isNotEmpty()
+                                    else -> true
+                                }
                             }
-                            PRoundButton(label = "TV-Guide", onLabel = setLabel, onClick = { controls = false; showGuide = true }) {
-                                PlayerIcon(PIcon.Guide, it)
-                            }
-                            PRoundButton(label = "Zurück zu Live", onLabel = setLabel, onClick = {
-                                if (LiveTimeshift.active) LiveTimeshift.goLive(player)
-                                else if (player.isCurrentMediaItemSeekable) player.seekToDefaultPosition()
-                                else { player.stop(); player.prepare() }
-                                player.play()
-                                behindSec = 0L
-                                controls = false
-                                flash = Flash(PIcon.Play, "LIVE")
-                            }) {
-                                PlayerIcon(PIcon.Play, it)
-                            }
-                            // Live buffer: 30 s back (the remote's seek keys jump by the step size)
-                            if (LiveTimeshift.active) {
-                                PRoundButton(label = "30 s zurück", onLabel = setLabel, onClick = {
-                                    LiveTimeshift.seekBy(player, -30_000L); flash = Flash(PIcon.Replay, "−30 s")
+                            // The first button of the row takes the focus when the controls open
+                            val firstBtn = if (seekBtn) "seekback" else shownIds.firstOrNull() ?: "menu"
+                            fun firstMod(id: String): Modifier = if (id == firstBtn) Modifier.focusRequester(liveFirst) else Modifier
+                            if (seekBtn) {
+                                PRoundButton(firstMod("seekback"), label = "$liveStepS Sekunden zurück", onLabel = setLabel, onClick = {
+                                    if (canBuf) { LiveTimeshift.seekBy(player, -step); flash = Flash(PIcon.Replay, "−$liveStepS s") } else rewindLive()
                                 }) { PlayerIcon(PIcon.Replay, it) }
                             }
-                            // Recording of the running show (from the buffer, without a second connection)
-                            if (cur.archive == null && TapLogic.tappable(resolvedUrl.ifEmpty { cur.url })) {
-                                val recOn = Recorder.isRecording(cur.itemId)
-                                PRoundButton(label = if (recOn) "Aufnahme beenden" else "Aufnehmen", onLabel = setLabel, onClick = {
-                                    val ch = curItem
-                                    if (ch == null) flash = Flash(null, "Sender unbekannt")
-                                    else if (recOn) { Recorder.stopFor(ctx, ch.id); flash = Flash(null, "Aufnahme beendet") }
-                                    else {
-                                        val ok = LiveTimeshift.active || LiveTimeshift.start(ctx, player, resolvedUrl.ifEmpty { cur.url })
-                                        val t = LiveTimeshift.tap
-                                        val r = if (ok && t != null) Recorder.start(ctx, ch, Epg.current(epg), t) else null
-                                        flash = Flash(null, if (r != null) "Aufnahme gestartet" else "Zu wenig freier Speicher")
-                                    }
-                                }) { c -> Box(Modifier.size(20.dp).clip(CircleShape).background(if (recOn) Color(0xFFFF3B30) else c)) }
+                            if (canBuf) {
+                                PRoundButton(label = "$liveStepS Sekunden vor", onLabel = setLabel, onClick = {
+                                    LiveTimeshift.seekBy(player, step); flash = Flash(PIcon.Forward, "+$liveStepS s")
+                                }) { PlayerIcon(PIcon.Forward, it) }
                             }
-                            if (Catchup.has(curItem)) {
-                                PRoundButton(label = "Von Anfang an", onLabel = setLabel, onClick = {
+                            for (id in shownIds) when (id) {
+                                PlayerButtonsLogic.BACKLIVE -> PRoundButton(firstMod(id), label = "Zurück zu Live", onLabel = setLabel, onClick = {
+                                    if (LiveTimeshift.active) LiveTimeshift.goLive(player)
+                                    else if (player.isCurrentMediaItemSeekable) player.seekToDefaultPosition()
+                                    else { player.stop(); player.prepare() }
+                                    player.play()
+                                    behindSec = 0L
+                                    controls = false
+                                    flash = Flash(PIcon.Play, "LIVE")
+                                }) {
+                                    PlayerIcon(PIcon.Play, it)
+                                }
+                                // Recording of the running show (from the buffer, without a second connection)
+                                PlayerButtonsLogic.REC -> {
+                                    val recOn = Recorder.isRecording(cur.itemId)
+                                    PRoundButton(firstMod(id), label = if (recOn) "Aufnahme beenden" else "Aufnehmen", onLabel = setLabel, onClick = {
+                                        val ch = curItem
+                                        if (ch == null) flash = Flash(null, "Sender unbekannt")
+                                        else if (recOn) { Recorder.stopFor(ctx, ch.id); flash = Flash(null, "Aufnahme beendet") }
+                                        else {
+                                            val ok = LiveTimeshift.active || LiveTimeshift.start(ctx, player, resolvedUrl.ifEmpty { cur.url })
+                                            val t = LiveTimeshift.tap
+                                            val r = if (ok && t != null) Recorder.start(ctx, ch, Epg.current(epg), t) else null
+                                            flash = Flash(null, if (r != null) "Aufnahme gestartet" else "Zu wenig freier Speicher")
+                                        }
+                                    }) { c -> Box(Modifier.size(20.dp).clip(CircleShape).background(if (recOn) Color(0xFFFF3B30) else c)) }
+                                }
+                                PlayerButtonsLogic.FROMSTART -> PRoundButton(firstMod(id), label = "Von Anfang an", onLabel = setLabel, onClick = {
                                     val ch = curItem
                                     val e = Epg.current(epg)
                                     if (ch != null && e != null) playArchive(ch, e) else flash = Flash(null, "Kein Programm bekannt")
                                 }) { AppIcon(AIcon.Catchup, it, size = 26.dp) }
-                                PRoundButton(Modifier.focusRequester(btn.getValue(Panel.ARCHIVE)), label = "Archiv: verpasste Sendungen", onLabel = setLabel, onClick = { openPanel(Panel.ARCHIVE) }) {
+                                PlayerButtonsLogic.ARCHIVE -> PRoundButton(Modifier.focusRequester(btn.getValue(Panel.ARCHIVE)).then(firstMod(id)), label = "Archiv: verpasste Sendungen", onLabel = setLabel, onClick = { openPanel(Panel.ARCHIVE) }) {
                                     AppIcon(AIcon.History, it, size = 26.dp)
                                 }
+                                // With own channel lists: choose where to (favorites or an own list); otherwise toggle favorite directly
+                                PlayerButtonsLogic.FAV -> Box {
+                                    var favMenu by remember { mutableStateOf(false) }
+                                    PRoundButton(
+                                        firstMod(id),
+                                        label = if (ChannelLists.lists.isNotEmpty()) "Favoriten & Listen" else if (fav) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen", onLabel = setLabel,
+                                        onClick = { if (ChannelLists.lists.isNotEmpty() && curItem != null) favMenu = true else Library.toggleFav(ctx, cur.itemId) }
+                                    ) { c -> PlayerIcon(if (fav) PIcon.StarOn else PIcon.StarOff, if (fav && c == Color.White) PT.Gold else c) }
+                                    val ci = curItem
+                                    if (favMenu && ci != null) ChannelMenu(ci, null, null) { favMenu = false }
+                                }
+                                PlayerButtonsLogic.TRACKS -> PRoundButton(Modifier.focusRequester(btn.getValue(Panel.TRACKS)).then(firstMod(id)), label = "Audio & Untertitel", onLabel = setLabel, onClick = { openPanel(Panel.TRACKS) }) {
+                                    PlayerIcon(PIcon.AudioSubs, it)
+                                }
+                                // Live channel with several qualities: pick the stream (4K / Full HD / HD / SD)
+                                PlayerButtonsLogic.QUALITY -> PRoundButton(firstMod(id), label = "Qualität", onLabel = setLabel, onClick = { openPanel(Panel.QUALITY) }) {
+                                    AppIcon(AIcon.Sliders, it, size = 26.dp)
+                                }
+                                PlayerButtonsLogic.SCORE -> PRoundButton(firstMod(id), label = "Score-Overlay", onLabel = setLabel, onClick = { scoreDlg = true }) {
+                                    AppIcon(AIcon.Live, it, size = 26.dp)
+                                }
+                                // Not shown by default (they are in the player menu "Settings"), but the user can add them back
+                                PlayerButtonsLogic.ASPECT -> PRoundButton(Modifier.focusRequester(btn.getValue(Panel.ASPECT)).then(firstMod(id)), label = "Bildformat", onLabel = setLabel, onClick = { openPanel(Panel.ASPECT) }) {
+                                    PlayerIcon(PIcon.Aspect, it)
+                                }
+                                // Second stream (round 22): without a second picture channel selection, otherwise the menu with arrangement, audio and swap
+                                PlayerButtonsLogic.SECOND -> PRoundButton(firstMod(id), label = "Zusatzbild", onLabel = setLabel, onClick = {
+                                    if (second == null) { pickSecond = true; controls = false; openChannels() } else openPanel(Panel.MENU)
+                                }) {
+                                    AppIcon(AIcon.Layers, it, size = 26.dp)
+                                }
+                                PlayerButtonsLogic.EXTERNAL -> PRoundButton(firstMod(id), label = "Extern öffnen", onLabel = setLabel, onClick = { player.pause(); openExternal(ctx, cur.url, cur.title) }) {
+                                    PlayerIcon(PIcon.External, it)
+                                }
                             }
-                            // With own channel lists: choose where to (favorites or an own list); otherwise toggle favorite directly
-                            Box {
-                                var favMenu by remember { mutableStateOf(false) }
-                                PRoundButton(
-                                    label = if (ChannelLists.lists.isNotEmpty()) "Favoriten & Listen" else if (fav) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen", onLabel = setLabel,
-                                    onClick = { if (ChannelLists.lists.isNotEmpty() && curItem != null) favMenu = true else Library.toggleFav(ctx, cur.itemId) }
-                                ) { c -> PlayerIcon(if (fav) PIcon.StarOn else PIcon.StarOff, if (fav && c == Color.White) PT.Gold else c) }
-                                val ci = curItem
-                                if (favMenu && ci != null) ChannelMenu(ci, null, null) { favMenu = false }
-                            }
-                            PRoundButton(Modifier.focusRequester(btn.getValue(Panel.TRACKS)), label = "Audio & Untertitel", onLabel = setLabel, onClick = { openPanel(Panel.TRACKS) }) {
-                                PlayerIcon(PIcon.AudioSubs, it)
-                            }
-                            PRoundButton(Modifier.focusRequester(btn.getValue(Panel.ASPECT)), label = "Bildformat", onLabel = setLabel, onClick = { openPanel(Panel.ASPECT) }) {
-                                PlayerIcon(PIcon.Aspect, it)
-                            }
-                            // Second stream (round 22): without a second picture channel selection, otherwise the menu with arrangement, audio and swap
-                            PRoundButton(label = "Zusatzbild", onLabel = setLabel, onClick = {
-                                if (second == null) { pickSecond = true; controls = false; openChannels() } else openPanel(Panel.MENU)
-                            }) {
-                                AppIcon(AIcon.Layers, it, size = 26.dp)
-                            }
-                            // Live channel with several qualities: pick the stream (4K / Full HD / HD / SD)
-                            if (cur.live && liveAlts.size > 1) PRoundButton(label = "Qualität", onLabel = setLabel, onClick = { openPanel(Panel.QUALITY) }) {
-                                AppIcon(AIcon.Sliders, it, size = 26.dp)
-                            }
-                            if (SportAlerts.miniOn || SportAlerts.pinned.isNotEmpty()) PRoundButton(label = "Score-Overlay", onLabel = setLabel, onClick = { scoreDlg = true }) {
-                                AppIcon(AIcon.Live, it, size = 26.dp)
-                            }
-                            PRoundButton(Modifier.focusRequester(btn.getValue(Panel.MENU)), label = "Einstellungen", onLabel = setLabel, onClick = { openPanel(Panel.MENU) }) {
+                            PRoundButton(Modifier.focusRequester(btn.getValue(Panel.MENU)).then(firstMod("menu")), label = "Einstellungen", onLabel = setLabel, onClick = { openPanel(Panel.MENU) }) {
                                 PlayerIcon(PIcon.Settings, it)
-                            }
-                            PRoundButton(label = "Extern öffnen", onLabel = setLabel, onClick = { player.pause(); openExternal(ctx, cur.url, cur.title) }) {
-                                PlayerIcon(PIcon.External, it)
                             }
                         }
                         Row(
                             Modifier.fillMaxWidth().padding(top = 12.dp).height(20.dp),
                             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(ctrlLabel.ifEmpty { "Senderliste" }, color = Muted, fontSize = 14.sp, maxLines = 1)
-                            Text("Hoch und Runter wechseln den Sender", color = Muted, fontSize = 14.sp, maxLines = 1)
+                            Text(ctrlLabel, color = Muted, fontSize = 14.sp, maxLines = 1)
+                            Text("Links: Senderliste  ·  Rechts: TV-Guide  ·  Hoch und Runter wechseln den Sender", color = Muted, fontSize = 14.sp, maxLines = 1)
                         }
                     } else {
                         val stepS = (step / 1000).toString()
@@ -1507,7 +1579,11 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                             onFocus = { if (it) ctrlLabel = "Zeitleiste  ·  Links/Rechts = $stepS s springen  ·  Halten = weiter springen" },
                             onDown = { runCatching { firstFocus.requestFocus() } },
                             onSeekKey = { stepSeek(it) },
-                            onRepeat = { repeatSeek(it) }
+                            onRepeat = { repeatSeek(it) },
+                            onTouchSeek = { x, w ->
+                                val t = TapSeekLogic.target(x, w, player.duration)
+                                if (t >= 0) { player.seekTo(t); pos = t; scrubTarget = -1L; turbo = 0; ping() }
+                            }
                         )
                         PTimeRow(posNow, durNow)
                         Spacer(Modifier.height(14.dp))
@@ -1622,7 +1698,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
 
         // ---------------------------------------------------------------- Menus
         if (panel != Panel.NONE) {
-            val back = if (panelParent != Panel.NONE) "Links = zurück" else "Links schließt das Menü"
+            val back = if (panelParent != Panel.NONE) "Links = zurück" else "Zurück schließt das Menü"
             when (panel) {
                 Panel.TRACKS -> TracksPanel(
                     player, tracksVer, { tracksVer++; h.postDelayed({ rememberTracks() }, 400) }, panelFocus, subsFocus,
@@ -1640,7 +1716,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                     panelParent = Panel.NONE; panel = Panel.NONE
                 }
 
-                Panel.SUBSTYLE -> PSimplePanel(440.dp, "Untertitel-Stil", back, { closePanel() }) {
+                Panel.SUBSTYLE -> PSimplePanel(440.dp, "Untertitel-Stil", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     Column(verticalArrangement = Arrangement.spacedBy(PT.RowGap)) {
                         PPanelRow("Größe", false, Modifier.focusRequester(panelFocus), trailing = SubStyle.SIZES[AppSettings.subSize].first, chevron = true) {
                             AppSettings.setSub(ctx, (AppSettings.subSize + 1) % SubStyle.SIZES.size, AppSettings.subColor, AppSettings.subBg, AppSettings.subEdge)
@@ -1658,7 +1734,7 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                     }
                 }
 
-                Panel.QUALITY -> PSimplePanel(440.dp, "Videoqualität", back, { closePanel() }) {
+                Panel.QUALITY -> PSimplePanel(440.dp, "Videoqualität", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     val video = remember(tracksVer) { collectTracks(player, C.TRACK_TYPE_VIDEO) }
                     val videoAuto = player.trackSelectionParameters.overrides.keys.none { it.type == C.TRACK_TYPE_VIDEO }
                     // Several sources of the same title (4K/FHD/HD as separate entries): switch by hand here
@@ -1715,25 +1791,30 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                     ArchivePanel(curItem, archChannels, cur.archive?.prog?.start, panelFocus, { closePanel() }) { ch, e -> playArchive(ch, e) }
                 }
 
-                Panel.SPEED -> PSimplePanel(400.dp, "Wiedergabe-Tempo", back, { closePanel() }) {
+                Panel.SPEED -> PSimplePanel(400.dp, "Wiedergabe-Tempo", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     PChoiceList(SPEEDS.map { speedLabel(it) }, speedIdx, panelFocus) { i ->
                         speedIdx = i
                         player.setPlaybackSpeed(SPEEDS[i])
                     }
                 }
 
-                Panel.SLEEP -> PSimplePanel(400.dp, "Sleep-Timer", back, { closePanel() }) {
+                Panel.SLEEP -> PSimplePanel(400.dp, "Sleep-Timer", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     PChoiceList(SLEEP_MIN.map { if (it == 0) "Aus" else "$it min" }, sleepIdx, panelFocus) { i ->
                         sleepIdx = i
                         sleepAt = if (i == 0) 0L else System.currentTimeMillis() + SLEEP_MIN[i] * 60_000L
                     }
                 }
 
-                Panel.ASPECT -> PSimplePanel(440.dp, "Bildformat", back, { closePanel() }) {
-                    PChoiceList(ASPECTS, aspect, panelFocus) { aspect = it; flash = Flash(null, ASPECTS[it]) }
+                Panel.ASPECT -> PSimplePanel(440.dp, "Bildformat", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
+                    PChoiceList(ASPECTS, aspect, panelFocus) {
+                        aspect = it
+                        // Crop and stretch change nothing when the picture already has the shape of the screen: say so
+                        val same = it in 1..2 && AspectLogic.sameShape(videoAr, 16f / 9f)
+                        flash = Flash(null, Lang.tr(ASPECTS[it]) + if (same) " – " + Lang.tr("Das Bild hat schon das Format des Fernsehers") else "")
+                    }
                 }
 
-                Panel.CLOCK -> PSimplePanel(440.dp, "Uhrzeit im Bild", back, { closePanel() }) {
+                Panel.CLOCK -> PSimplePanel(440.dp, "Uhrzeit im Bild", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     val poss = listOf("Oben rechts", "Oben links", "Unten rechts", "Unten links")
                     val sizes = listOf("Klein", "Mittel", "Groß")
                     val ops = listOf(20, 30, 40, 50, 60, 70, 80, 90, 100)
@@ -1763,14 +1844,24 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                     }
                 }
 
-                Panel.STEP -> PSimplePanel(400.dp, "Sprungweite", back, { closePanel() }) {
+                Panel.SUBDELAY -> PSimplePanel(440.dp, "Untertitel-Verzögerung", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
+                    SyncRows(PlayerSync.subMs, 100, 1000, panelFocus, "Später", "Früher",
+                        "Gilt nur für diesen Titel. Später = der Text erscheint später.") { PlayerSync.setSub(it) }
+                }
+
+                Panel.AVDELAY -> PSimplePanel(440.dp, "Ton-Verzögerung", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
+                    SyncRows(PlayerSync.avMs, 50, 250, panelFocus, "Später", "Früher",
+                        "Später = der Ton kommt später als das Bild. Gilt für alle Titel auf diesem Gerät.") { PlayerSync.setAv(ctx, it) }
+                }
+
+                Panel.STEP -> PSimplePanel(400.dp, "Sprungweite", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     Text("Gilt für Links/Rechts, Halten und die Zeitleiste.", color = Muted, fontSize = 14.sp, modifier = Modifier.padding(bottom = 12.dp))
                     PChoiceList(STEP_OPTIONS.map { "$it s" }, STEP_OPTIONS.indexOf(AppSettings.seekStep).coerceAtLeast(0), panelFocus) { i ->
                         AppSettings.setPlayer(ctx, AppSettings.skipIntro, AppSettings.showInfo, STEP_OPTIONS[i])
                     }
                 }
 
-                Panel.MENU -> PSimplePanel(440.dp, "Einstellungen", back, { closePanel() }) {
+                Panel.MENU -> PSimplePanel(440.dp, "Einstellungen", back, { closePanel() }, leftBack = panelParent != Panel.NONE) {
                     val entries = buildList<MenuEntry> {
                         if (cur.live) add(MenuEntry(20, "Zusatzbild", second?.title ?: "Aus", false))
                         if (cur.live && second != null) {
@@ -1784,6 +1875,8 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                         }
                         add(MenuEntry(0, "Sprungweite", "${step / 1000} s", true))
                         add(MenuEntry(1, "Untertitel-Stil", null, true))
+                        add(MenuEntry(30, "Untertitel-Verzögerung", PlayerSync.label(PlayerSync.subMs), true))
+                        add(MenuEntry(31, "Ton-Verzögerung", PlayerSync.label(PlayerSync.avMs), true))
                         add(MenuEntry(2, "Videoqualität", currentAlts().size.takeIf { it > 1 }?.let { "$it Quellen" }, true))
                         add(MenuEntry(3, "Wiedergabe-Tempo", speedLabel(SPEEDS[speedIdx]), true))
                         add(MenuEntry(4, "Bildformat", ASPECTS[aspect].substringBefore(" ("), true))
@@ -1813,6 +1906,8 @@ fun PlayerScreen(req: PlayReq, zapList: List<Item>, liveAll: List<Item>, seriesI
                                     4 -> openPanel(Panel.ASPECT, Panel.MENU)
                                     8 -> openPanel(Panel.SLEEP, Panel.MENU)
                                     10 -> openPanel(Panel.CLOCK, Panel.MENU)
+                                    30 -> openPanel(Panel.SUBDELAY, Panel.MENU)
+                                    31 -> openPanel(Panel.AVDELAY, Panel.MENU)
                                     11 -> techOn = !techOn
                                     13 -> AppSettings.setAutoOutro(ctx, !AppSettings.autoSkipOutro)
                                     9 -> { panel = Panel.NONE; panelParent = Panel.NONE; lastChannel() }

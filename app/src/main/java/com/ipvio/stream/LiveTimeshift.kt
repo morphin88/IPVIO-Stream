@@ -31,6 +31,12 @@ object LiveSettings {
     /** Minutes of overrun after the end of the show according to the TV guide. */
     var recPad by mutableIntStateOf(3)
         private set
+    /** Up = next channel and Down = previous channel in Live TV (T-052). false = default: Up = previous. */
+    var upIsNext by mutableStateOf(false)
+        private set
+    /** #96: automatic genre categories (Sport, Movies, ...) before the provider's categories in Live TV. Default on, as before. */
+    var genres by mutableStateOf(true)
+        private set
     private var inited = false
 
     fun init(c: Context) {
@@ -41,11 +47,16 @@ object LiveSettings {
         bufferMb = p.getInt("mb", 512).takeIf { it in BUFFER_MB } ?: 512
         recDir = p.getInt("dir", 0).coerceAtLeast(0)
         recPad = p.getInt("pad", 3).coerceIn(0, 30)
+        upIsNext = p.getBoolean("up_next", false)
+        genres = p.getBoolean("genres", true)
     }
 
     private fun save(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-        .putBoolean("ts", timeshift).putInt("mb", bufferMb).putInt("dir", recDir).putInt("pad", recPad).apply()
+        .putBoolean("ts", timeshift).putInt("mb", bufferMb).putInt("dir", recDir).putInt("pad", recPad)
+        .putBoolean("up_next", upIsNext).putBoolean("genres", genres).apply()
 
+    fun setUpIsNext(c: Context, v: Boolean) { upIsNext = v; save(c) }
+    fun setGenres(c: Context, v: Boolean) { genres = v; save(c) }
     fun setTimeshift(c: Context, v: Boolean) { timeshift = v; save(c) }
     fun setBufferMb(c: Context, v: Int) { bufferMb = v; save(c) }
     fun setRecDir(c: Context, v: Int) { recDir = v; save(c) }
@@ -113,16 +124,15 @@ class TapAwareDataSource(private val normal: DataSource) : DataSource {
         val d = if (dataSpec.uri.scheme == "tap") TapDataSource().also { s -> listeners.forEach { s.addTransferListener(it) } } else normal
         cur = d
         if (dataSpec.uri.scheme != "https") return d.open(dataSpec)
-        // Provider certificate does not match its address: use the same address over http (once per host, remembered)
+        // Provider certificate does not match its address (#69): http only after the user agreed for this host, otherwise ask
         val url = dataSpec.uri.toString()
-        if (TlsFallback.isBrokenUrl(url)) TlsFallback.downgradeUrl(url)?.let { return d.open(dataSpec.withUri(Uri.parse(it))) }
+        // A host the user agreed to goes straight to http: no failing https attempt before every request and segment
+        TlsFallback.preferredUrl(url)?.let { return d.open(dataSpec.withUri(Uri.parse(it))) }
         try {
             return d.open(dataSpec)
         } catch (e: IOException) {
-            val low = if (TlsFallback.isHostMismatch(e)) TlsFallback.downgradeUrl(url) else null
-            if (low == null) throw e
-            dataSpec.uri.host?.let { TlsFallback.markBroken(it) }
-            Diag.report("Zertifikat passt nicht zur Adresse – Wiedergabe ohne Verschlüsselung")
+            val low = TlsFallback.fallbackFor(url, e) ?: throw e
+            Diag.report("Certificate does not match the address: playing without encryption (you agreed)")
             runCatching { d.close() }
             return d.open(dataSpec.withUri(Uri.parse(low)))
         }
@@ -171,9 +181,13 @@ object LiveTimeshift {
     fun start(c: Context, player: ExoPlayer, url: String): Boolean {
         val old = tap
         if (old != null && old.url == url && !old.closed) { goLive(player); return true }
-        val t = LiveTaps.open(c, url) ?: return false
-        tap = t
+        // T-054: release the previous channel's buffer before the new one is opened, so only one buffer fills at a time
+        tap = null
         old?.release()
+        version++
+        val t = LiveTaps.open(c, url)
+        if (t == null) { version++; return false }
+        tap = t
         version++
         goLive(player)
         return true

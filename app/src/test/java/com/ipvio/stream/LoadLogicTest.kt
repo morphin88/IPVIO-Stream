@@ -148,9 +148,10 @@ http://h/x
 
     @Test fun vorauswahlNachGeraetesprache() {
         val counts = mapOf("de" to 50, "en" to 80, "tr" to 20, "yu" to 5, "?" to 3)
-        assertEquals(setOf("de"), LoadLogic.systemPreselect(counts, "de"))
-        assertEquals(setOf("yu"), LoadLogic.systemPreselect(counts, "sr"))       // Serbian → Ex-YU
-        assertEquals(setOf("en"), LoadLogic.systemPreselect(counts, "fr"))       // not present → English
+        // Untagged ("?") buckets are preselected too (commit 3114773: untagged and adult buckets)
+        assertEquals(setOf("de", LangTagLogic.UNKNOWN), LoadLogic.systemPreselect(counts, "de"))
+        assertEquals(setOf("yu", LangTagLogic.UNKNOWN), LoadLogic.systemPreselect(counts, "sr"))       // Serbian → Ex-YU
+        assertEquals(setOf("en", LangTagLogic.UNKNOWN), LoadLogic.systemPreselect(counts, "fr"))       // not present → English
         assertEquals(emptySet<String>(), LoadLogic.systemPreselect(mapOf("tr" to 1), "fr"))
         assertEquals("he", LoadLogic.langCodeOf("iw"))
         assertEquals("nb", LoadLogic.langCodeOf("no"))
@@ -166,5 +167,46 @@ http://h/x
         assertNull(LoadFun.line(10 * 60_000L)!!.second)
         assertEquals(3, LoadFun.stage(15 * 60_000L))
         assertTrue(LoadFun.line(3 * 3_600_000L) != null)   // no crash even after hours (rotation)
+    }
+
+    @Test fun parallelXtreamPartIsRetriedAloneOnNetworkErrorOrIncompleteAnswer() {
+        assertTrue(LoadLogic.retriesSequentially(java.io.IOException("reset")))
+        assertTrue(LoadLogic.retriesSequentially(PlaylistError("no list", incomplete = true)))
+        assertFalse(LoadLogic.retriesSequentially(PlaylistError("login failed")))
+        assertFalse(LoadLogic.retriesSequentially(java.util.concurrent.CancellationException("abort")))
+        assertFalse(LoadLogic.retriesSequentially(null))
+    }
+
+    // Xtream get.php with live channels only (movies and series missing although the provider has them)
+
+    @Test fun vodLineIsAMovieOrSeriesAddress() {
+        assertTrue(LoadLogic.isVodLine("http://h:8080/movie/u/p/3.mkv"))
+        assertTrue(LoadLogic.isVodLine("http://h:8080/series/u/p/9.mp4"))
+        assertFalse(LoadLogic.isVodLine("http://h:8080/live/u/p/1.ts"))
+        assertFalse(LoadLogic.isVodLine("http://h:8080/u/p/1"))
+        assertFalse(LoadLogic.isVodLine("#EXTINF:-1 group-title=\"/movie/\",X"))
+    }
+
+    @Test fun listWithAMovieHasVod() = assertTrue(LoadLogic.hasVod(m3u.lineSequence()))
+
+    @Test fun liveOnlyListHasNoVod() {
+        val live = "#EXTM3U\n#EXTINF:-1 group-title=\"News\",A\nhttp://h/live/u/p/1.ts\n#EXTINF:-1,B\nhttp://h/u/p/2\n"
+        assertFalse(LoadLogic.hasVod(live.lineSequence()))
+    }
+
+    // T-067: categories of movies and series in a get.php list, to see whether most of the provider's are missing
+    @Test fun vodGroupsCollectsMovieAndSeriesCategories() {
+        val m3u = "#EXTM3U\n#EXTINF:-1 group-title=\"News\",A\nhttp://h/live/u/p/1.ts\n" +
+            "#EXTINF:-1 group-title=\"Action\",M\nhttp://h/movie/u/p/2.mp4\n" +
+            "#EXTINF:-1 group-title=\"Drama \",S S01E01\nhttp://h/series/u/p/3.mkv\n"
+        val g = LoadLogic.vodGroups(m3u.lineSequence())
+        assertEquals(setOf("action"), g.movies)
+        assertEquals(setOf("drama"), g.series)
+    }
+
+    @Test fun partialVodListIsDetectedByCategories() {
+        val api = listOf("Action", "Drama", "Comedy", "Horror", "Kids", "Docu")
+        assertTrue(LoadLogic.missingCategories(api, setOf("action", "drama")))
+        assertFalse(LoadLogic.missingCategories(api, setOf("action", "drama", "comedy", "horror")))
     }
 }

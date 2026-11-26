@@ -1,6 +1,12 @@
 package com.ipvio.stream
 
-enum class Kind { LIVE, MOVIE, SERIES }
+enum class Kind {
+    LIVE { override val displayName = "Live TV" },
+    MOVIE { override val displayName = "Movies" },
+    SERIES { override val displayName = "Series" };
+
+    abstract val displayName: String
+}
 
 data class Variant(val url: String, val label: String, val quality: String?, val lang: String?)
 
@@ -130,7 +136,9 @@ data class Item(
     /** Language according to the provider's tag (abbreviation from [LangTagLogic], "?" = no tag). */
     val lang: String = LangTagLogic.UNKNOWN,
     /** Source with several playlists shown at once: 0 = main playlist, 1 … = further ones (see [MultiLogic]). */
-    val src: Int = 0
+    val src: Int = 0,
+    /** #22: date the provider added the title (Unix seconds, 0 = unknown, e.g. older caches or M3U). */
+    val added: Long = 0L
 ) {
     // Key for the metadata cache: computed once per title instead of anew on every sort comparison.
     // Own field instead of "by lazy": saves two helper objects per title with 100,000+ titles.
@@ -146,7 +154,18 @@ class ParsedPlaylist(
     val items: List<Item>, val epgUrls: List<String>,
     val counts: Map<String, Int> = emptyMap(), val bytes: Map<String, Long> = emptyMap(),
     /** Channels with archive (catchup) according to the playlist: channel ID → details. */
-    val catchup: Map<String, CatchupInfo> = emptyMap()
+    val catchup: Map<String, CatchupInfo> = emptyMap(),
+    /** T-067: what parsing left out and why (for the load report on the Diagnostics page). */
+    val report: ParseReport = ParseReport()
+)
+
+/**
+ * T-067: entries of a list and where they went. [entries] = address lines with an #EXTINF line, [separators] = skipped
+ * divider lines ("##### DE #####"), [hiddenLang] / [hiddenMode] = left out by the language filter or the content mode,
+ * [episodes] = series entries (episodes or placeholders) that were combined into [Kind.SERIES] items.
+ */
+class ParseReport(
+    val entries: Int = 0, val separators: Int = 0, val hiddenLang: Int = 0, val hiddenMode: Int = 0, val episodes: Int = 0
 )
 
 /** Result of the quick scan pass (without creating titles): titles and amount of data per language. */
@@ -265,11 +284,33 @@ object M3uParser {
         epgFromHeader(text.lineSequence().firstOrNull { it.startsWith("#EXTM3U") })
 
     private fun clean(raw: String): String {
-        var t = LangTagLogic.stripDashTag(raw.replace(PREFIX, ""))
+        // T-068: each regular expression only runs when its cheap necessary condition holds (same result, the profile of a
+        // 205,000-entry list on the JVM showed clean() as the largest part of parsing)
+        var t = if (raw.indexOf('|') >= 0 || raw.indexOf(':') >= 0) raw.replace(PREFIX, "") else raw
+        t = LangTagLogic.stripDashTag(t)
         if (t.indexOf('(') >= 0 || t.indexOf('[') >= 0) t = t.replace(BRACKETS, "")
-        t = t.replace(TAGS, "")
-        t = t.replace(SPACES, " ").trim().trim('-', '|', ':', '.', ' ')
+        if (mayHaveTag(t)) t = t.replace(TAGS, "")
+        if (hasDoubleSpace(t)) t = t.replace(SPACES, " ")
+        t = t.trim().trim('-', '|', ':', '.', ' ')
         return if (t.isBlank()) raw.trim() else t
+    }
+
+    /** Necessary condition for [TAGS]: one of its words' letters ("4k", "hd", "hevc", "h265", "1080", "720", "multi", "german", "dual"). */
+    internal fun mayHaveTag(s: String): Boolean {
+        if (mayHaveQuality(s)) return true
+        return s.contains("hevc", true) || s.contains("h265", true) || s.contains("multi", true) ||
+            s.contains("german", true) || s.contains("dual", true)
+    }
+
+    /** Necessary condition for [SPACES] (`\s{2,}`): two whitespace characters in a row. */
+    internal fun hasDoubleSpace(s: String): Boolean {
+        var prev = false
+        for (ch in s) {
+            val w = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\u000B' || ch == '\u000C' || ch == '\r'
+            if (w && prev) return true
+            prev = w
+        }
+        return false
     }
 
     private fun isSeparator(n: String): Boolean {
@@ -318,6 +359,8 @@ object M3uParser {
         var info: String? = null
         var name: String? = null
         var group = "Sonstige"
+        var extGroup: String? = null   // #145: a "#EXTGRP:" line applies until the next one
+        var titleGroup = false
         var header = false
         var k = 0
         for (line in lines) {
@@ -326,7 +369,12 @@ object M3uParser {
             if (l.startsWith("#EXTINF")) {
                 info = l
                 name = l.substringAfterLast(',').trim()
-                group = attr(l, "group-title")?.ifBlank { null } ?: "Sonstige"
+                val g = attr(l, "group-title")?.ifBlank { null } ?: M3uGroupLogic.fromInfo(l)
+                titleGroup = g != null
+                group = g ?: extGroup ?: "Sonstige"
+            } else if (l.startsWith("#EXTGRP:", ignoreCase = true)) {
+                extGroup = M3uGroupLogic.fromExtGrp(l)
+                if (!titleGroup && info != null) group = extGroup ?: "Sonstige"
             } else if (l.isNotEmpty() && !l.startsWith("#")) {
                 val n = name
                 val inf = info
@@ -334,10 +382,17 @@ object M3uParser {
                     onEntry(Entry(inf, n, group, l))
                     if (++k % 2000 == 0) check?.invoke()
                 }
-                name = null; info = null
+                name = null; info = null; extGroup = null
             }
         }
     }
+
+    /**
+     * Address of a live channel: contains "/live/" (Xtream "…/live/user/pass/123.ts", Stalker "stalker://…/live/…")
+     * or is the Xtream form without it ("…/user/pass/123", see [LiveUrlLogic.isXtreamLiveTail])
+     * and is not a video file (a plain web server folder named "live" with .mp4 files stays a movie).
+     */
+    internal fun isLiveUrl(url: String): Boolean = !isVideoFile(url) && LiveUrlLogic.isLive(url)
 
     /** The episode pattern needs an "S" directly followed by a digit; names without it skip the regular expression. */
     internal fun mayBeEpisode(name: String): Boolean {
@@ -357,9 +412,11 @@ object M3uParser {
         val m = if (mayBeEpisode(e.name)) SE.find(e.name) else null
         val isSeriesUrl = e.url.contains("/series/")
         val isMovie = e.url.contains("/movie/") || isVideoFile(e.url) || langOf.vod(e.group)
-        // Stalker channels are always live, even in groups like "ENGLISH | PREMIUM MOVIES" (movie channels)
-        val stalkerLive = e.url.startsWith("stalker://") && e.url.contains("/live/")
-        val kind = if (stalkerLive) Kind.LIVE else if (m != null || isSeriesUrl) Kind.SERIES else if (isMovie) Kind.MOVIE else Kind.LIVE
+        // Channels with a live address are always live, even in groups like "ENGLISH | PREMIUM MOVIES" or
+        // "EU | DE | Movies and Series" (24/7 movie channels). Before, the category name made them movies, so they
+        // were missing from Live TV (and hidden completely with "Live TV only"). Applies to Stalker and Xtream addresses.
+        val liveUrl = isLiveUrl(e.url)
+        val kind = if (liveUrl) Kind.LIVE else if (m != null || isSeriesUrl) Kind.SERIES else if (isMovie) Kind.MOVIE else Kind.LIVE
         val lang = langOf.of(e.group, e.name, kind == Kind.LIVE)
         val countKey = if (kind == Kind.SERIES) (m?.groupValues?.get(1) ?: e.name).trim().lowercase() else null
         st.add(lang, e.info.length + e.url.length + 2, countKey)
@@ -374,7 +431,12 @@ object M3uParser {
      * one after another, beginnings/labels/languages as references to shared texts. Saves a good 30 MB at the peak when parsing large lists
      * (580,000 episodes).
      */
-    private class SeriesAcc(val title: String, val logo: String?, val group: String, val q: String?, val lang: String) {
+    private class SeriesAcc(
+        val title: String, val logo: String?, val group: String, val q: String?, val lang: String,
+        val dist: String? = null, val placeholder: Boolean = false
+    ) {
+        /** T-067: split off from the first series of the same name (then its year or country tells them apart). */
+        var split = false
         var n = 0
         var ss = IntArray(4)
         var nn = IntArray(4)
@@ -432,24 +494,45 @@ object M3uParser {
         var header: String? = null
         var headCu: CatchupInfo? = null
         val catchup = HashMap<String, CatchupInfo>()
+        val mergeSeasons = LangTagLogic.MERGE_SEASONS in hidden   // #151
 
+        var nEntries = 0; var nSep = 0; var nLang = 0; var nMode = 0; var nEp = 0
         entries(lines, check, onHeader = { header = it; headCu = CatchupLogic.fromInfo(it, "") }) { e ->
-            val kd = classify(e, st, langOf) ?: return@entries
-            if (LangTagLogic.hides(hidden, kd.lang, kd.kind)) return@entries
+            nEntries++
+            val kd = classify(e, st, langOf) ?: run { nSep++; return@entries }
+            if (LangTagLogic.hides(hidden, kd.lang, kd.kind)) { if (kd.lang in hidden) nLang++ else nMode++; return@entries }
+            if (kd.kind == Kind.SERIES) nEp++
             val group = pool.of(e.group)
             val q = quality(e.name, e.group)
             when (kd.kind) {
                 Kind.SERIES -> {
                     val m = kd.se
                     // Key (= series ID) as before from the cleaned name, so Resume/My list are preserved
-                    val cleaned = clean(m?.groupValues?.get(1) ?: e.name)
-                    val key = cleaned.lowercase()
+                    val rawName = m?.groupValues?.get(1) ?: e.name
+                    var cleaned = clean(rawName)
+                    var season = m?.groupValues?.get(2)?.toIntOrNull() ?: 1
+                    // #151: a provider series that is one season of a show ("Show S02") joins the other seasons of that show
+                    var seasonOf = false
+                    if (mergeSeasons && e.url.endsWith("." + XtreamLogic.LAZY_EXT)) {
+                        SeasonMergeLogic.split(cleaned)?.let { (b, s) -> cleaned = b; season = s; seasonOf = true }
+                    }
+                    val base = cleaned.lowercase()
+                    // T-067: same name, but another provider series (placeholder in another category, or other year or
+                    // country): own key. The first one keeps its key, title and year, so its ID and data stay the same.
+                    // A season joined by #151 is never split off again.
+                    val dist = SeriesKeyLogic.distinguisher(rawName)
+                    val ph = SeriesKeyLogic.isPlaceholder(e.url)
+                    var key = base
+                    val first = series[base]
+                    if (!seasonOf && first != null && SeriesKeyLogic.differs(first.group, first.dist, first.placeholder, group, dist, ph)) {
+                        key = SeriesKeyLogic.altKey(base, group, dist, first.group != group)
+                    }
                     val title = TitleText.title(cleaned)
                     val acc = series.getOrPut(key) {
-                        SeriesAcc(title, attr(e.info, "tvg-logo")?.ifBlank { null }, group, q, kd.lang)
+                        SeriesAcc(title, attr(e.info, "tvg-logo")?.ifBlank { null }, group, q, kd.lang, dist, ph)
+                            .also { if (key != base) it.split = true }
                     }
                     if (acc.done) return@entries
-                    val season = m?.groupValues?.get(2)?.toIntOrNull() ?: 1
                     val num = m?.groupValues?.get(3)?.toIntOrNull() ?: (acc.n + 1)
                     val vl = pool.ofOrNull(LANG.find(e.name)?.groupValues?.get(1)?.uppercase())
                     val label = pool.of(listOfNotNull(vl, q, group.take(18)).joinToString(" · "))
@@ -458,7 +541,8 @@ object M3uParser {
                 Kind.MOVIE -> {
                     val year = YEAR.find(e.name)?.groupValues?.get(1)?.toIntOrNull()
                     out.add(Item(e.url.hashCode().toString(), Kind.MOVIE, TitleText.title(clean(e.name)), year, e.url,
-                        attr(e.info, "tvg-logo")?.ifBlank { null }, group, quality = q, lang = kd.lang))
+                        attr(e.info, "tvg-logo")?.ifBlank { null }, group, quality = q, lang = kd.lang,
+                        added = attr(e.info, "added")?.toLongOrNull() ?: 0L))
                 }
                 Kind.LIVE -> {
                     val id = e.url.hashCode().toString()
@@ -490,9 +574,13 @@ object M3uParser {
                 }
                 i = j
             }
-            out.add(Item("s_$key", Kind.SERIES, acc.title, null, "", acc.logo, acc.group, EpisodeTable.of(eps, pool), acc.q, lang = acc.lang))
+            // T-067: a series split off from the first one of its name: the year goes into the year field, a country into the
+            // title ("The Office (UK)"). The first series stays exactly as before.
+            val year = if (acc.split) SeriesKeyLogic.yearOf(acc.dist) else null
+            val title = if (acc.split && acc.dist != null && year == null) "${acc.title} (${acc.dist})" else acc.title
+            out.add(Item("s_$key", Kind.SERIES, title, year, "", acc.logo, acc.group, EpisodeTable.of(eps, pool), acc.q, lang = acc.lang))
         }
         out.trimToSize()
-        return ParsedPlaylist(out, epgFromHeader(header), st.counts(), st.bytes, catchup)
+        return ParsedPlaylist(out, epgFromHeader(header), st.counts(), st.bytes, catchup, ParseReport(nEntries, nSep, nLang, nMode, nEp))
     }
 }

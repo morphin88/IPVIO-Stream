@@ -54,6 +54,9 @@ const val CAT_WATCH = "Meine Liste"
 
 fun isTopEntry(name: String) = name == CAT_RECENT || name == CAT_WATCH
 
+/** Row text of a folder built from shared category patterns (#96): "FR  ›". */
+fun folderLabel(prefix: String) = "$prefix  ›"
+
 private fun sortFor(name: String, sort: Int) = if (isTopEntry(name)) 8 else sort
 
 object CatPrefs {
@@ -77,7 +80,8 @@ private val TILE_COLORS = listOf(
 @Composable
 fun CategoriesScreen(
     req: CatReq, tab: Int,
-    onPick: (String, List<Item>, Int) -> Unit, onOpen: (Item) -> Unit,
+    /** The last argument is the genre when an IPVIO genre category was opened, otherwise null (#27). */
+    onPick: (String, List<Item>, Int, String?) -> Unit, onOpen: (Item) -> Unit,
     onBack: () -> Unit, onGoTab: (Int) -> Unit
 ) {
     val ctx = LocalContext.current
@@ -95,8 +99,34 @@ fun CategoriesScreen(
     var inSidebar by remember { mutableStateOf(false) }
     BackHandler(enabled = !inPills) { runCatching { pillFocus.requestFocus() } }
     BackHandler(enabled = inPills) { onBack() }
+    // #96: an open folder ("FR ›") — back leaves the folder first
+    var folder by remember { mutableStateOf<String?>(null) }
+    BackHandler(enabled = folder != null) { folder = null }
 
-    val map = if (mode == 0) req.ipvio else req.provider
+    // #96: provider categories with a shared pattern ("FR - SPORTS", "FR - AMAZON") are shown as one folder row
+    val folders = remember(req.provider) { if (req.provider.isEmpty()) emptyList() else GroupPatternLogic.analyze(req.provider.keys.toList()).first }
+    val folderByLabel = remember(folders) { folders.associateBy { folderLabel(it.prefix) } }
+    val providerView: Map<String, List<Item>> = remember(req.provider, folders) {
+        if (folders.isEmpty()) req.provider else {
+            val firstOf = HashMap<String, GroupPatternLogic.Folder>()
+            val member = HashSet<String>()
+            for (f in folders) { firstOf[f.subs.first().second] = f; f.subs.forEach { member.add(it.second) } }
+            val m = LinkedHashMap<String, List<Item>>()
+            for ((k, v) in req.provider) {
+                val f = firstOf[k]
+                if (f != null) m[folderLabel(f.prefix)] = f.subs.flatMap { req.provider[it.second].orEmpty() }
+                else if (k !in member) m[k] = v
+            }
+            m
+        }
+    }
+    val openFolder = folder?.let { p -> folders.firstOrNull { it.prefix == p } }
+    val map = if (mode == 0) req.ipvio else if (openFolder != null) openFolder.subs.associate { it.second to req.provider[it.second].orEmpty() } else providerView
+    // A folder row opens the folder; every other row works as before
+    val pickOrOpen: (String, List<Item>, Int) -> Unit = { name, items, s ->
+        val f = folderByLabel[name]
+        if (mode == 1 && f != null) { folder = f.prefix } else { onPick(name, items, s, if (mode == 0 && name != "Sonstige" && req.ipvio.containsKey(name)) name else null) }
+    }
     val entries = remember(map, az, saved, CatOrder.version, req.recent, req.watch) {
         val l = map.entries.map { it.key to it.value }
         val base = if (saved && area != null) CatOrder.sorted(area, map.keys.toList()).mapNotNull { k -> map[k]?.let { k to it } }
@@ -127,6 +157,7 @@ fun CategoriesScreen(
                     val sel = if (mode == 0) 1 else 0
                     DropdownPill("Filter", modes[sel], modes, sel, modifier = Modifier.focusRequester(pillFocus), icon = FIcon.Genre) {
                         mode = if (it == 1) 0 else 1
+                        folder = null
                         AppSettings.set(ctx, mode == 0)
                     }
                     if (saved && area != null) {
@@ -157,23 +188,35 @@ fun CategoriesScreen(
                 // Menu key / long OK on a provider category: move it (switches to the own order)
                 val onMove: ((String, Int) -> Unit)? = if (saved && area != null) { name, how ->
                     val names = map.keys.toList()
-                    if (how == 0) CatOrder.toTop(ctx, area, names, name) else CatOrder.move(ctx, area, names, name, how)
+                    when (how) {
+                        MOVE_TOP -> CatOrder.toTop(ctx, area, names, name)
+                        MOVE_BOTTOM -> CatOrder.toBottom(ctx, area, names, name)
+                        else -> CatOrder.move(ctx, area, names, name, how)
+                    }
                 } else null
-                if (CatPrefs.listView) ListMode(req.title, entries, catSort, firstFocus, pillFocus, onPick, onOpen, onMove) { bgItem = it }
-                else TileMode(entries, catSort, firstFocus, onPick)
+                val title = if (openFolder != null) req.title + "  ·  " + openFolder.prefix else req.title
+                if (CatPrefs.listView) ListMode(title, entries, catSort, firstFocus, pillFocus, pickOrOpen, onOpen, onMove, mode == 1) { bgItem = it }
+                else TileMode(entries, catSort, firstFocus, pickOrOpen)
             }
         }
         Sidebar(tab, onGoTab, Modifier.align(SidebarPrefs.align()), sideFocus) { inSidebar = it }
     }
 }
 
+/** Codes for onMove in [ListMode] besides a plain step (-1 / +1). */
+private const val MOVE_TOP = Int.MIN_VALUE
+private const val MOVE_BOTTOM = Int.MAX_VALUE
+
 object CatMemory {
     val sel = HashMap<String, Int>()
+    /** #65: name of the selected category per list. Restored by name, because an index can point to another row after a rebuild. */
+    val selName = HashMap<String, String>()
     val item = HashMap<String, Int>()
     val restore = HashMap<String, Boolean>()
 
     fun reset() {
         sel.clear()
+        selName.clear()
         item.clear()
         restore.clear()
     }
@@ -183,10 +226,12 @@ object CatMemory {
 private fun ListMode(
     title: String, entries: List<Pair<String, List<Item>>>, sort: Int, firstFocus: FocusRequester, pillFocus: FocusRequester,
     onPick: (String, List<Item>, Int) -> Unit, onOpen: (Item) -> Unit,
-    onMove: ((String, Int) -> Unit)?, onFocusItem: (Item) -> Unit
+    onMove: ((String, Int) -> Unit)?, provider: Boolean, onFocusItem: (Item) -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    var sel by remember { mutableIntStateOf((CatMemory.sel[title] ?: 0).coerceIn(0, maxOf(entries.lastIndex, 0))) }
+    // #65: restore the category by its name first; the index is only the fallback (rows can move or change)
+    val byName = CatMemory.selName[title]?.let { n -> entries.indexOfFirst { it.first == n } }?.takeIf { it >= 0 }
+    var sel by remember { mutableIntStateOf(byName ?: (CatMemory.sel[title] ?: 0).coerceIn(0, maxOf(entries.lastIndex, 0))) }
     var inPreview by remember { mutableStateOf(false) }
     var pendingPreview by remember { mutableStateOf(false) }
     var focusedItem by remember { mutableStateOf<Item?>(null) }
@@ -214,7 +259,10 @@ private fun ListMode(
         kotlinx.coroutines.delay(600)
         StalkerMore.prefetch(ctx, c.first, c.second.mapTo(HashSet()) { it.kind })
     }
-    SideEffect { CatMemory.sel[title] = sel }
+    SideEffect {
+        CatMemory.sel[title] = sel
+        cur?.first?.let { CatMemory.selName[title] = it }
+    }
     // Unique row keys (a provider category could be called like a top entry)
     val rowKeys = remember(entries) { val seen = HashSet<String>(); entries.mapIndexed { i, e -> if (seen.add(e.first)) e.first else e.first + "#" + i } }
     // After moving a category the selection follows it to its new place
@@ -223,8 +271,15 @@ private fun ListMode(
         val m = movedName ?: return@LaunchedEffect
         movedName = null
         val j = entries.indexOfFirst { it.first == m }
-        if (j >= 0) sel = j
+        if (j >= 0) {
+            sel = j
+            // Keep the moved row in view (moving to the top or the bottom jumps far)
+            if (catState.layoutInfo.visibleItemsInfo.none { it.index == j }) catState.scrollToItem(maxOf(j - 3, 0))
+        }
     }
+    // Issue 19: "Move with Up/Down" lets the category float: Up/Down move it, OK or Back puts it down
+    var floating by remember { mutableStateOf<String?>(null) }
+    BackHandler(enabled = floating != null) { floating = null }
     BackHandler(enabled = inPreview) { runCatching { firstFocus.requestFocus() } }
     LaunchedEffect(cur?.first) {
         focusedItem = prev.firstOrNull()
@@ -259,17 +314,46 @@ private fun ListMode(
             itemsIndexed(entries, key = { i, e -> rowKeys.getOrElse(i) { e.first + "#" + i } }) { i, e ->
                 var moveMenu by remember { mutableStateOf(false) }
                 val all = if (isTopEntry(e.first)) e.second else StalkerMore.withAdded(e.first, e.second)
+                val isFloating = floating == e.first
+                val privKind = if (provider && !isTopEntry(e.first)) e.second.firstOrNull()?.kind else null
                 Box {
                     CatListRow(
                         e.first, StalkerMore.total(ctx, e.first, setOfNotNull(e.second.firstOrNull()?.kind)) ?: all.size, i == sel,
-                        if (i == sel) Modifier.focusRequester(firstFocus) else Modifier,
+                        (if (i == sel) Modifier.focusRequester(firstFocus) else Modifier).then(
+                            if (isFloating && onMove != null) Modifier.onPreviewKeyEvent { k ->
+                                // While floating every key belongs to the move: Up/Down move, OK puts it down, Left/Right do nothing
+                                if (k.type != KeyEventType.KeyDown) return@onPreviewKeyEvent k.key != Key.Back
+                                when (k.key) {
+                                    Key.DirectionUp -> { movedName = e.first; onMove(e.first, -1); true }
+                                    Key.DirectionDown -> { movedName = e.first; onMove(e.first, 1); true }
+                                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> { floating = null; true }
+                                    Key.Back -> false
+                                    else -> true
+                                }
+                            } else Modifier
+                        ),
                         onFocus = { sel = i }, onRight = { focusPreview() },
-                        onMenu = if (onMove != null && !isTopEntry(e.first)) ({ moveMenu = true }) else null
-                    ) { onPick(e.first, all, sortFor(e.first, sort)) }
-                    if (moveMenu && onMove != null) OptionPopup(listOf("Nach oben verschieben", "Nach unten verschieben", "An den Anfang verschieben"), -1, { moveMenu = false }) { k ->
-                        moveMenu = false
-                        movedName = e.first
-                        onMove(e.first, when (k) { 0 -> -1; 1 -> 1; else -> 0 })
+                        onMenu = if ((onMove != null || privKind != null) && !isTopEntry(e.first)) ({ moveMenu = true }) else null,
+                        floating = isFloating
+                    ) { if (!isFloating) onPick(e.first, all, sortFor(e.first, sort)) }
+                    // Issue 19: the menu stays open while moving step by step; the row (and with it the menu) follows the category.
+                    // Provider categories also get "Privat machen" (T-028); genre lists have no private option.
+                    val moves = if (onMove != null) listOf("Mit Hoch/Runter verschieben", "Nach oben verschieben", "Nach unten verschieben", "An den Anfang verschieben", "Ans Ende verschieben") else emptyList()
+                    if (moveMenu) OptionPopup(
+                        moves + listOfNotNull(privKind?.let { if (PrivateCats.isPrivate(it, e.first)) "Nicht mehr privat" else "Privat machen" }),
+                        -1, { moveMenu = false }
+                    ) { k ->
+                        if (k >= moves.size || onMove == null) { moveMenu = false; privKind?.let { privateToggle(ctx, it, e.first) } }
+                        else {
+                            movedName = e.first
+                            when (k) {
+                                0 -> { moveMenu = false; floating = e.first }
+                                1 -> onMove(e.first, -1)
+                                2 -> onMove(e.first, 1)
+                                3 -> { moveMenu = false; onMove(e.first, MOVE_TOP) }
+                                else -> { moveMenu = false; onMove(e.first, MOVE_BOTTOM) }
+                            }
+                        }
                     }
                 }
             }
@@ -316,15 +400,17 @@ private fun ListMode(
 @Composable
 private fun CatListRow(
     name: String, count: Int, selected: Boolean, modifier: Modifier,
-    onFocus: () -> Unit, onRight: () -> Unit, onMenu: (() -> Unit)? = null, onClick: () -> Unit
+    onFocus: () -> Unit, onRight: () -> Unit, onMenu: (() -> Unit)? = null, floating: Boolean = false, onClick: () -> Unit
 ) {
     var f by remember { mutableStateOf(false) }
     val shape = RoundedCornerShape(DS.RadiusS)
     Row(
         modifier.fillMaxWidth().clip(shape)
-            .then(if (onMenu != null) Modifier.favKeys(onMenu) else Modifier)
-            .background(if (f) DS.Overlay4 else if (selected) DS.Overlay2 else Color.Transparent)
-            .border(DS.Border, if (f) Accent2 else Color.Transparent, shape)
+            .then(if (onMenu != null && !floating) Modifier.favKeys(onMenu) else Modifier)
+            // Floating (being moved): lifted look, so it is clear that Up/Down now move the category
+            .graphicsLayer { if (floating) { scaleX = 1.04f; scaleY = 1.04f } }
+            .background(if (floating) Accent2.copy(alpha = 0.30f) else if (f) DS.Overlay4 else if (selected) DS.Overlay2 else Color.Transparent)
+            .border(DS.Border, if (f || floating) Accent2 else Color.Transparent, shape)
             .onFocusChanged { f = it.isFocused; if (it.isFocused) onFocus() }
             .onPreviewKeyEvent { k ->
                 if (k.type == KeyEventType.KeyDown && k.key == Key.DirectionRight && k.nativeKeyEvent.repeatCount == 0) { onRight(); true } else false
@@ -335,7 +421,7 @@ private fun CatListRow(
     ) {
         Text(name, color = if (isTopEntry(name)) Accent2 else Color.White, fontSize = 14.sp, fontWeight = if (selected || isTopEntry(name)) FontWeight.Bold else FontWeight.Normal,
             maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-        Text("$count", color = Muted, fontSize = 13.sp)
+        if (floating) AppIcon(AIcon.Sliders, Accent2, size = 16.dp) else Text("$count", color = Muted, fontSize = 13.sp)
     }
 }
 

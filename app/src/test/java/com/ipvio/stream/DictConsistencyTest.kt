@@ -10,7 +10,7 @@ class DictConsistencyTest {
 
     @Test fun placeholders_eindeutig_und_in_allen_sprachen() {
         val problems = ArrayList<String>()
-        for (block in listOf(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictNl1, DictNl2, DictNl3, DictNl4, DictNl5, DictNl6)) {
+        for (block in listOf(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictN, DictP, DictNl1, DictNl2, DictNl3, DictNl4, DictNl5, DictNl6, DictAr1, DictAr2, DictAr3, DictAr4, DictAr5, DictAr6, DictPt1, DictPt2, DictPt3, DictPt4, DictPt5, DictPt6, DictPt7, DictPl1, DictPl2, DictPl3, DictPl4, DictPl5, DictPl6, DictPl7, DictW, DictPlW)) {
             for (line in block.lineSequence()) {
                 if (line.isBlank() || line.startsWith("#") || !line.contains('¦')) continue
                 val cols = line.split('¦')
@@ -27,7 +27,7 @@ class DictConsistencyTest {
     }
 
     @Test fun niederlaendisch_deckt_alle_zeilen_ab() {
-        I18nCore.load(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM)
+        I18nCore.load(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictN)
         val nl = I18nCore.CODES.indexOf("nl")
         assertEquals(9, nl)
         I18nCore.loadColumn(nl, DictNl1, DictNl2, DictNl3, DictNl4, DictNl5)
@@ -36,11 +36,43 @@ class DictConsistencyTest {
         assertEquals("Nederlands", I18nCore.NATIVE[nl])
     }
 
+    @Test fun polnisch_deckt_alle_zeilen_ab() {
+        I18nCore.load(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictN, DictO, DictW)
+        val pl = I18nCore.CODES.indexOf("pl")
+        assertEquals(11, pl)   // after Arabic (index 10)
+        I18nCore.loadColumn(pl, DictPl1, DictPl2, DictPl3, DictPl4, DictPl5, DictPl6, DictPl7, DictPl8, DictPlW)
+        assertEquals("Dodaj playlistę", I18nCore.translate("Playlist hinzufügen", pl))
+        assertEquals("Odcinki: 8", I18nCore.translate("8 Folgen", pl))
+        assertEquals("Polski", I18nCore.NATIVE[pl])
+        // Every German key of the main and wishbox dictionaries has a Polish row
+        val keys = HashSet<String>()
+        for (block in listOf(DictPl1, DictPl2, DictPl3, DictPl4, DictPl5, DictPl6, DictPl7, DictPl8, DictPlW))
+            for (line in block.lineSequence()) if (line.contains('¦')) keys.add(line.substringBefore('¦').trim())
+        val missing = ArrayList<String>()
+        for (block in listOf(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictN, DictO, DictW))
+            for (line in block.lineSequence()) {
+                if (line.isBlank() || line.startsWith("#") || !line.contains('¦')) continue
+                val de = line.substringBefore('¦').trim()
+                if (de !in keys) missing.add(de)
+            }
+        assertTrue(missing.joinToString("\n"), missing.isEmpty())
+    }
+
     @Test fun zahlen_werden_richtig_eingesetzt() {
-        I18nCore.load(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM)
+        I18nCore.load(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictN)
         assertEquals("loading 5/10", I18nCore.translate("lädt 5/10", 1))
         assertEquals("8 episodes", I18nCore.translate("8 Folgen", 1))
         assertEquals("No connection: SocketException", I18nCore.translate("Keine Verbindung: SocketException", 1))
         assertEquals("Server not found (DNS)", I18nCore.translate("Server nicht gefunden (DNS)", 1))
+    }
+
+    @Test fun portugiesisch_deckt_alle_zeilen_ab() {
+        I18nCore.load(DictA, DictB, DictC, DictD, DictE, DictF, DictG, DictH, DictI, DictJ, DictK, DictL, DictM, DictN, DictO)
+        val pt = I18nCore.CODES.indexOf("pt")
+        assertEquals(13, pt)   // after Chinese (index 12)
+        I18nCore.loadColumn(pt, DictPt1, DictPt2, DictPt3, DictPt4, DictPt5, DictPt6, DictPt7)
+        assertEquals("Adicionar lista", I18nCore.translate("Playlist hinzufügen", pt))
+        assertEquals("8 episódios", I18nCore.translate("8 Folgen", pt))
+        assertEquals("Português (Brasil)", I18nCore.NATIVE[pt])
     }
 }

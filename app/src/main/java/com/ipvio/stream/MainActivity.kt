@@ -38,10 +38,17 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Load settings early so colors and size are right in the very first frame.
         Profiles.init(this)
+        SublistStore.clearActiveOnce(this)   // T-035: the sublist tab is gone; drop active filters once
         Profiles.prewarm(this)
+        TlsFallback.init(this)   // #69: hosts the user agreed to (ipvio_tls)
         val pick = Profiles.needsPicker(this)
         if (!pick) AppSettings.init(this)
         General.init(this)
+        AppDns.init(this)   // T-049f: before the first connection
+        // T-047: read the stored playlist while the first screen is built (not with the profile picker: the profile is not chosen yet)
+        if (!pick) Thread({ runCatching { PlaylistStore.preread(applicationContext) } }, "list-preread").start()
+        // T-047: parse the dictionary of the UI language off the main thread while the first screen is built (German: nothing to do)
+        Thread({ runCatching { Lang.prewarm() } }, "lang-prewarm").start()
         Boomer.init(this)
         HomeLayout.init(this); BoomerLayout.init(this)
         SidebarPrefs.init(this)
@@ -70,6 +77,16 @@ class MainActivity : ComponentActivity() {
         setContent { App(pick) }
     }
 
+    /** T-049a: OK on a sports alert (goal, kick-off) jumps to a channel that shows the game; every other key as usual. */
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        val ok = event.keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER || event.keyCode == android.view.KeyEvent.KEYCODE_ENTER
+        if (ok && SportAlerts.current?.game != null && SportAlerts.jumpTarget(SportAlerts.current) != null) {
+            if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) SportAlerts.jump()
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     /** Reminder tapped while the app is already running: open the channel. */
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
@@ -79,10 +96,14 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         Reminders.foreground = true
+        // W-010b: fetch changes from the other devices (only once AppContent has started the live sync)
+        LiveSync.onForeground()
     }
 
     override fun onStop() {
         Reminders.foreground = false
+        // W-010b: upload pending changes when leaving the app
+        LiveSync.onBackground()
         super.onStop()
     }
 
@@ -151,7 +172,10 @@ fun App(pick: Boolean = false) {
     CompositionLocalProvider(
         LocalDensity provides scaled,
         LocalBringIntoViewSpec provides SmoothSpec,
-        LocalOverscrollFactory provides null
+        LocalOverscrollFactory provides null,
+        // T-029: Arabic is laid out right to left (the other languages stay left to right)
+        androidx.compose.ui.platform.LocalLayoutDirection provides
+            (if (Lang.code() == "ar") androidx.compose.ui.unit.LayoutDirection.Rtl else androidx.compose.ui.unit.LayoutDirection.Ltr)
     ) {
         val c = LocalContext.current
         var picked by remember { mutableStateOf(!pick) }
@@ -162,6 +186,10 @@ fun App(pick: Boolean = false) {
         }
         // New version available: dialog with one button (above every screen)
         UpdatePromptHost()
+        // Provider certificate does not match its address: ask once per host before an unencrypted connection (#69)
+        TlsConsentDialog()
+        // #95: keep the screen awake while the app is open, if the user switched it on (default off)
+        KeepScreenOn("browse", General.keepAwakeBrowse)
         // First start without a playlist: one non-blocking card that checks for updates (T-014)
         if (picked) UpdateCardHost()
     }
@@ -182,8 +210,10 @@ private val SE_RE = Regex("""S(\d+)E(\d+)""")
 private fun AppContent() {
     val ctx = LocalContext.current
     remember {
-        AppSettings.init(ctx); WatchStore.init(ctx); History.init(ctx); Library.init(ctx); QualityStore.init(ctx)
-        PlaybackPrefs.init(ctx); DeadLinks.init(ctx); ChannelLists.init(ctx); Reminders.init(ctx); Reminders.schedule(ctx); 0
+        AppSettings.init(ctx); WatchStore.init(ctx); History.init(ctx); Library.init(ctx); QualityStore.init(ctx); PrivateCats.init(ctx)
+        PlaybackPrefs.init(ctx); PlayerSync.init(ctx); AudioLevel.init(ctx); loadWishboxTexts(); DeadLinks.init(ctx); ChannelLists.init(ctx); Reminders.init(ctx); Reminders.schedule(ctx)
+        // W-010b: live sync of favorites and history (silent; only when Google Drive is connected)
+        LiveSync.start(ctx); 0
     }
     // Interrupted in the middle of adding last time (crash, power loss): the add screen automatically continues loading
     val resumeAdd = remember { PlaylistStore.pending(ctx)?.autoResume == true }
@@ -201,6 +231,8 @@ private fun AppContent() {
     var cats by remember { mutableStateOf<CatReq?>(null) }
     var playing by remember { mutableStateOf<PlayReq?>(null) }
     var tab by remember { mutableStateOf(SettingsLogic.resolveStartTab(General.startTab, AppSettings.menuOrder.toList(), AppSettings.menuHidden.toList())) }
+    // W-002: the start page is the movie or series area: open its categories as well
+    LaunchedEffect(Unit) { if (General.vodCats && (tab == 1 || tab == 2)) AppNav.pendingVodCats = tab }
     val gridState = remember(browse) { LazyGridState() }
     val states = listOf(
         rememberLazyListState(), rememberLazyListState(), rememberLazyListState(),
@@ -208,6 +240,20 @@ private fun AppContent() {
         rememberLazyListState(), rememberLazyListState(), rememberLazyListState(), rememberLazyListState()
     )
 
+    // W-004: "What's new" once after an update to a new version
+    LaunchedEffect(Unit) { runCatching { WhatsNew.check(ctx) } }
+    // T-056: the search index is built in the background as soon as the list is there (and again after every list change),
+    // so opening the search does not wait for it. Same list object as the search screen uses, so the cache is hit.
+    val searchList = PlaylistStore.channels
+    LaunchedEffect(searchList) {
+        withContext(Dispatchers.Default) { runCatching { SearchCache.build(PrivateCats.visible(searchList)) } }
+    }
+    // T-031: Trakt history and watchlist into the app once the playlist is there (at most every 6 hours, needs a sign-in).
+    // Waits 8 s so the first screens and the playlist refresh get the CPU and the network first.
+    val traktReady = searchList.isNotEmpty() && !PlaylistStore.loading
+    LaunchedEffect(traktReady) {
+        if (traktReady) { kotlinx.coroutines.delay(8_000); runCatching { TraktSync.autoSync(ctx) } }
+    }
     // New app version on GitHub? Check silently once a day; a find appears in the bell at the top right.
     LaunchedEffect(Unit) {
         delay(3_000)   // only after the start, the playlist takes priority
@@ -218,9 +264,13 @@ private fun AppContent() {
         withContext(Dispatchers.IO) { General.cleanupLegacy(ctx) }
         if (resumeAdd) return@LaunchedEffect
         PlaylistStore.savedUrl(ctx)?.let { u ->
-            val skip = !SettingsLogic.refreshDue(General.plan(), General.lastRefresh, System.currentTimeMillis(), General.zone())
-            val ok = PlaylistStore.load(ctx, u, false, skip)
-            if (ok && !skip) General.markRefreshed(ctx)
+            // T-048b: the plan of this playlist (its own, otherwise the general one)
+            val skip = !SettingsLogic.refreshDue(PlaylistRefresh.effective(ctx, u), PlaylistRefresh.lastFor(ctx, u), System.currentTimeMillis(), General.zone())
+            val ok = PlaylistStore.load(ctx, u, false, skip, startup = true)
+            if (ok && !skip) PlaylistRefresh.markFor(ctx, u)
+            // Other playlists with their own plan that is due: in the background, after the first screens
+            delay(20_000)
+            runCatching { PlaylistStore.refreshOthersDue(ctx) }
         }
     }
 
@@ -246,10 +296,13 @@ private fun AppContent() {
 
     val all = PlaylistStore.channels
     val liveAll = remember(all) { all.filter { it.kind == Kind.LIVE } }
+    SideEffect { SportAlerts.liveChannels = liveAll }
     // Do not fall into the screensaver while downloading and parsing the playlist
     KeepScreenOn("playlist", PlaylistStore.loading)
     // Genre detection in the background; restarts cleanly with every new list (reload, language filter, parental control)
-    LaunchedEffect(all) { kotlinx.coroutines.delay(8_000); if (!DemoMode.active) Classifier.restart(ctx, all) }   // after the first screen is up, and debounced while the list is still changing
+    LaunchedEffect(all) { kotlinx.coroutines.delay(8_000); if (!DemoMode.active) Classifier.restart(ctx, all) }
+    // Private categories (T-028): ids of their titles, so history and resume can skip them
+    LaunchedEffect(all) { PrivateCats.reload(all) }   // after the first screen is up, and debounced while the list is still changing
 
     fun start(item: Item, title: String, url: String, startMs: Long = 0L) {
         if (DemoMode.active) return   // sample entries have no stream address
@@ -316,6 +369,8 @@ private fun AppContent() {
     fun goTab(id: Int) {
         if (id == MenuLogic.EPG) { openEpg(); return }
         tab = id; CatMemory.reset()
+        // W-002: movies/series straight to their categories (the area opens them when its data is ready)
+        AppNav.pendingVodCats = if (General.vodCats && !ViewLive.active && (id == 1 || id == 2)) id else -1
         jumpTick++
     }
 
@@ -400,6 +455,19 @@ private fun AppContent() {
         val d = detail
         val b = browse
         val c = cats
+        // T-056: name of the shown screen, for the opening time in the diagnostics log
+        val shownName = when {
+            p != null -> "Player"
+            personTop != null -> "Person"
+            d != null -> "Detail"
+            b != null -> "Browse"
+            c != null -> "Categories"
+            adding -> "Add playlist"
+            tab == 4 && all.isNotEmpty() -> "Search"
+            tab == MenuLogic.DOWNLOADS -> "Downloads"
+            else -> "Tab $tab"
+        }
+        ScreenTimer(shownName)
         when {
             p != null -> {
                 val zap = if (p.live || p.archive != null) {
@@ -423,7 +491,13 @@ private fun AppContent() {
                 key(p) {
                     PlayerScreen(p, zap, liveAll, seriesItem) {
                         // Live: back in Live TV on the last watched channel (also after switching in the player)
-                        if (p.live || p.archive != null) LastFocus.pending = History.ids.firstOrNull { id -> liveAll.any { it.id == id } }
+                        // Live TV tab is 3 (see LiveTab: ContentFocus.tab = 3). Without this, a stream started from Home returns to Home.
+                        // Exception: a stream started in the Sports Hub returns to the hub (maintainer, 23 Nov 2026); the hub restores
+                        // its open pages and tab itself (HubMemory)
+                        if ((p.live || p.archive != null) && tab != MenuLogic.SPORT) {
+                            LastFocus.pending = History.ids.firstOrNull { id -> liveAll.any { it.id == id } }
+                            tab = 3
+                        }
                         playing = null
                     }
                 }
@@ -445,7 +519,7 @@ private fun AppContent() {
             ) }
             c != null -> Box(Modifier.fillMaxSize().screenEnter()) { CategoriesScreen(
                 c, tab,
-                onPick = { name, list, sort -> browse = BrowseState(BrowseReq(name, list, sort)) },
+                onPick = { name, list, sort, genre -> browse = BrowseState(BrowseReq(name, list, sort, genre)) },
                 onOpen = open,
                 onBack = { cats = null },
                 onGoTab = { if (it != MenuLogic.EPG) cats = null; goTab(it) }
@@ -474,8 +548,11 @@ private fun AppContent() {
                 tab = tab, state = states[4],
                 onOpen = open,
                 onBrowse = { browse = BrowseState(it) },
-                onTab = { goTab(it) }
+                onTab = { goTab(it) },
+                onPerson = { pushTop(it) }
             ) }
+            tab == MenuLogic.DOWNLOADS -> Box(Modifier.fillMaxSize().screenEnter(tab)) { DownloadsTab(tab = tab, onTab = { goTab(it) },
+                onPlay = { e -> start(Item(e.id, Kind.MOVIE, e.title, null, e.url, null, "Downloads"), e.title, e.url, 0L) }) }
             else -> Box(Modifier.fillMaxSize().screenEnter(tab)) { HomeScreen(
                 tab = tab, onTab = { goTab(it) }, states = states,
                 onOpen = open,
@@ -493,6 +570,8 @@ private fun AppContent() {
             ) }
         }
         if (RemoteUi.show) RemoteOverlay(Modifier.align(Alignment.Center))
+        // W-004: not over the player or the add screen, and not at the same time as the update dialog
+        if (p == null && !adding && (AppUpdate.available == null || AppUpdate.promptDismissed)) WhatsNewHost()
         // Live preview of the View settings: bar at the bottom, the real app stays visible
         if (ViewLive.active) ViewLivePanel(ctx, goTab = { goTab(it) }, closeCats = { cats = null; browse = null }) {
             ViewLive.active = false

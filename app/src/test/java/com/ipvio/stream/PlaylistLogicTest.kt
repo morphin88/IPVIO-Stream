@@ -39,6 +39,8 @@ class PlaylistLogicTest {
         )
         for (e in list) assertFalse(PlaylistLogic.friendlyError(e).contains("geheim"))
         assertEquals("Keine Sender in der Playlist gefunden.", PlaylistLogic.friendlyError(PlaylistError("Keine Sender in der Playlist gefunden.")))
+        // Out of memory must show the text the add screen recognises (it then offers "Sprachen wählen")
+        assertEquals(PlaylistLogic.TOO_BIG_HINT, PlaylistLogic.friendlyError(OutOfMemoryError()))
         assertTrue(PlaylistLogic.httpError(403).contains("403"))
     }
 
@@ -112,5 +114,11 @@ class Runde14ListTest {
         assertFalse(s.contains("  "))
         // shortened at a word boundary
         assertTrue(s.removeSuffix("…").split(" ").all { it.startsWith("Wort") && it.length > 4 })
+    }
+
+    @Test fun unexpectedLoadError_namesThePlaceInTheApp() {
+        val e = runCatching { error("boom") }.exceptionOrNull()!!
+        val msg = PlaylistLogic.friendlyError(e)
+        assertTrue(msg, msg.startsWith("Laden fehlgeschlagen (IllegalStateException, PlaylistLogicTest.kt:"))
     }
 }

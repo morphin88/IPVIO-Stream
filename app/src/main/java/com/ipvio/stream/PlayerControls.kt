@@ -1,5 +1,8 @@
 package com.ipvio.stream
 
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -41,7 +44,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -131,7 +133,7 @@ fun PSkipPill(text: String, modifier: Modifier = Modifier, onClick: () -> Unit) 
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         PlayerIcon(PIcon.NextEp, if (f) DS.FocusInk else Color.White, size = 16.dp)
-        Text(if (f && !text.endsWith("(OK)")) "$text  (OK)" else text, color = if (f) DS.FocusInk else Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        Text(Lang.tr(text.removeSuffix("(OK)").trimEnd()) + (if (f || text.endsWith("(OK)")) "  (OK)" else ""), raw = true, color = if (f) DS.FocusInk else Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
     }
 }
 
@@ -202,12 +204,16 @@ fun PSeekBar(
     pos: () -> Long, dur: () -> Long, buffered: () -> Long, segs: () -> List<Seg>,
     scrubbing: () -> Boolean,
     onFocus: (Boolean) -> Unit,
-    onDown: () -> Unit, onSeekKey: (Int) -> Unit, onRepeat: (Int) -> Unit
+    onDown: () -> Unit, onSeekKey: (Int) -> Unit, onRepeat: (Int) -> Unit,
+    onTouchSeek: (x: Float, width: Int) -> Unit = { _, _ -> }
 ) {
     var f by remember { mutableStateOf(false) }
     val active = f || scrubbing()
     Box(
         modifier.height(32.dp)
+            // Phones and tablets (#25): tapping or dragging on the timeline jumps to that position
+            .pointerInput(Unit) { detectTapGestures { o -> onTouchSeek(o.x, size.width) } }
+            .pointerInput(Unit) { detectHorizontalDragGestures { ch, _ -> onTouchSeek(ch.position.x, size.width) } }
             .onFocusChanged { f = it.isFocused; onFocus(it.isFocused) }
             .onKeyEvent { e ->
                 if (e.type != KeyEventType.KeyDown) false
@@ -303,7 +309,6 @@ fun PEndsAt(pos: () -> Long, dur: () -> Long, speed: () -> Float) {
 fun BoxScope.PPanelFrame(
     width: Dp, title: String, hint: String,
     modifier: Modifier = Modifier,
-    onEdgeDown: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit
 ) {
     val maxH = (LocalConfiguration.current.screenHeightDp - 64).coerceAtLeast(240).dp
@@ -312,14 +317,9 @@ fun BoxScope.PPanelFrame(
         Modifier.align(Alignment.TopEnd).padding(top = PT.MarginY, end = PT.MarginY)
             .width(width).heightIn(max = maxH)
             .clip(shape).background(PT.PanelBg).border(1.dp, PT.PanelBorder, shape)
-            // Down at the end of the list: close the menu, the focus goes back to the icon in the control bar.
-            // "exit" is called only when the focus would leave the menu downward (i.e. nothing below in the menu).
-            .focusProperties {
-                exitTo { dir ->
-                    if (dir == FocusDirection.Down && onEdgeDown != null) { onEdgeDown(); FocusRequester.Cancel }
-                    else FocusRequester.Default
-                }
-            }
+            // W-006: the focus never leaves an open menu with the arrow keys (Down at the end used to close it).
+            // "exit" is called only when the focus would leave the menu; only Back (or Left in a submenu) closes it.
+            .focusProperties { exitTo { FocusRequester.Cancel } }
             .focusGroup()
             .then(modifier)
             .padding(24.dp)
@@ -330,19 +330,23 @@ fun BoxScope.PPanelFrame(
     }
 }
 
-/** Menu with standard keys: Left closes, Right stays in the menu. */
+/**
+ * Menu with standard keys: Left goes back to the parent menu ([leftBack]), Right stays in the menu.
+ * The top-level menu closes only with Back (W-006); Left does nothing there.
+ */
 @Composable
 fun BoxScope.PSimplePanel(
-    width: Dp, title: String, hint: String, onClose: () -> Unit,
+    width: Dp, title: String, hint: String, onClose: () -> Unit, leftBack: Boolean = false,
     content: @Composable ColumnScope.() -> Unit
 ) {
     PPanelFrame(
         width, title, hint,
         Modifier
-            .onPreviewKeyEvent { e -> if (e.type == KeyEventType.KeyDown && e.key == Key.DirectionLeft) { onClose(); true } else false }
+            .onPreviewKeyEvent { e ->
+                if (e.type == KeyEventType.KeyDown && e.key == Key.DirectionLeft) { if (leftBack) onClose(); true } else false
+            }
             // Swallow Right only after the rows: rows with an arrow open their submenu with it, otherwise the focus stays in the menu
             .onKeyEvent { e -> e.type == KeyEventType.KeyDown && e.key == Key.DirectionRight },
-        onEdgeDown = onClose,
         content = content
     )
 }

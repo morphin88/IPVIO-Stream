@@ -11,7 +11,12 @@ import java.security.SecureRandom
 import kotlin.concurrent.thread
 
 /** A playlist sent from the phone: either an M3U link or Xtream login data. */
-class PhoneInput(val url: String, val host: String, val user: String, val pass: String) {
+class PhoneInput(
+    val url: String,
+    val host: String,
+    val user: String,
+    val pass: String,
+) {
     val isXtream get() = url.isBlank()
 }
 
@@ -28,11 +33,15 @@ object PhoneImportLogic {
     /** Validates input; null = invalid. */
     fun toInput(f: Map<String, String>): PhoneInput? {
         val url = f["url"].orEmpty().trim()
-        if (url.isNotEmpty()) return if (url.startsWith("http://") || url.startsWith("https://")) PhoneInput(url, "", "", "") else null
+        if (url.isNotEmpty()) return if (url.startsWith("http://") || url.startsWith("https://")) PhoneInput(
+            url, "", "", ""
+        ) else null
         val host = f["host"].orEmpty().trim()
         val user = f["user"].orEmpty().trim()
         val pass = f["pass"].orEmpty().trim()
-        return if (host.isNotEmpty() && user.isNotEmpty() && pass.isNotEmpty()) PhoneInput("", host, user, pass) else null
+        return if (host.isNotEmpty() && user.isNotEmpty() && pass.isNotEmpty()) PhoneInput(
+            "", host, user, pass
+        ) else null
     }
 
     fun newCode(rnd: java.util.Random): String = (1000 + rnd.nextInt(9000)).toString()
@@ -57,7 +66,7 @@ object PhoneImportLogic {
     fun message(de: Boolean, kind: String): String = message(if (de) 0 else 1, kind)
 
     /** What the page additionally offers (round 20). */
-    class Features(val upload: Boolean = false, val transfer: Boolean = false, val crash: Boolean = false, val epg: Boolean = false, val list: Boolean = false)
+    class Features(val upload: Boolean = false, val transfer: Boolean = false, val crash: Boolean = false, val epg: Boolean = false, val list: Boolean = false, val keys: Boolean = false, val vpn: Boolean = false)
 
     private const val CSS = """body{font-family:system-ui,sans-serif;background:#0B0F19;color:#fff;margin:0;padding:20px;max-width:560px}
 h1{font-size:22px}h2{font-size:16px;color:#9aa;margin-top:28px}a{color:#86EFAC}pre{white-space:pre-wrap;background:#171a26;padding:12px;border-radius:10px;font-size:13px}
@@ -69,7 +78,7 @@ button{width:100%;padding:14px;margin-top:10px;border:0;border-radius:10px;backg
     private fun sendFileJs(fn: String, path: String, codeId: String, fileId: String, statusId: String): String =
         """<script>function $fn(){var f=document.getElementById('$fileId').files[0];var c=document.getElementById('$codeId').value;if(!f){return}
 document.getElementById('$statusId').textContent='…';fetch('$path?code='+encodeURIComponent(c)+'&name='+encodeURIComponent(f.name),{method:'POST',body:f})
-.then(function(r){return r.text()}).then(function(t){document.open();document.write(t);document.close()}).catch(function(){document.getElementById('$statusId').textContent='Error'})}</script>"""
+.then(function(r){return r.text()}).then(function(t){document.open();document.write(t);document.close()}).catch(function(e){document.getElementById('$statusId').textContent='Error: '+((e&&e.message)||e)})}</script>"""
 
     fun page(li: Int): String = page(li, Features())
 
@@ -101,14 +110,40 @@ button{width:100%;padding:14px;margin-top:10px;border:0;border-radius:10px;backg
 <input name="code" inputmode="numeric" maxlength="4" placeholder="${t("Code vom Fernseher", "Code from the TV")}" required>
 <textarea name="epg" rows="3" placeholder="http://…/xmltv.php?username=…&amp;password=…"></textarea>
 <button type="submit">${t("An den Fernseher senden", "Send to TV")}</button></form>""" else "") +
-            (if (feats.list) """<h2>${t("Listen importieren (Letterboxd, MyAnimeList, Trakt)", "Import lists (Letterboxd, MyAnimeList, Trakt)")}</h2>
-<p>${t("Exportdatei wählen: Letterboxd ZIP oder CSV, MyAnimeList XML, Trakt JSON. Titel, die in deiner Playlist vorkommen, kommen in Merkliste bzw. Verlauf.", "Choose the export file: Letterboxd ZIP or CSV, MyAnimeList XML, Trakt JSON. Titles found in your playlist go to the watchlist or history.")}</p>
+            (if (feats.list) """<h2>${t("Import & Trakt (Letterboxd, MyAnimeList, Trakt)", "Import & Trakt (Letterboxd, MyAnimeList, Trakt)")}</h2>
+<p>${t("Exportdatei wählen: Letterboxd ZIP oder CSV, MyAnimeList XML. Titel, die in deiner Playlist vorkommen, kommen in Merkliste bzw. Verlauf.", "Choose the export file: Letterboxd ZIP or CSV, MyAnimeList XML. Titles found in your playlist go to the watchlist or history.")}</p>
 <input id="lc" inputmode="numeric" maxlength="4" placeholder="${t("Code vom Fernseher", "Code from the TV")}">
 <input id="lf" type="file">
 <button onclick="lu()">${t("Liste hochladen", "Upload list")}</button><p id="ls"></p>""" + sendFileJs("lu", "/listimport", "lc", "lf", "ls") else "") +
+            (if (feats.vpn) """<h2>${t("WireGuard-Konfiguration (VPN)", "WireGuard configuration (VPN)")}</h2>
+<p>${t("Wähle die .conf-Datei deines VPN-Anbieters. Sie enthält einen privaten Schlüssel: sende sie nur über dein eigenes WLAN.", "Choose the .conf file of your VPN provider. It contains a private key: only send it over your own Wi-Fi.")}</p>
+<input id="vc" inputmode="numeric" maxlength="4" placeholder="${t("Code vom Fernseher", "Code from the TV")}">
+<input id="vf" type="file" accept=".conf,text/plain">
+<button onclick="vp()">${t("Datei hochladen", "Upload file")}</button><p id="vs"></p>""" + sendFileJs("vp", "/vpn", "vc", "vf", "vs") else "") +
+            (if (feats.keys) """<h2><a href="/keys">${t("API-Schlüssel eingeben (TMDB, OMDb, Untertitel)", "Enter API keys (TMDB, OMDb, subtitles)")}</a></h2>""" else "") +
             (if (feats.transfer) """<h2><a href="/transfer">${t("Einstellungen auf ein anderes Gerät übertragen", "Transfer settings to another device")}</a></h2>""" else "") +
             (if (feats.crash) """<h2><a href="/crash">${t("Letzten Absturzbericht anzeigen", "Show the last crash report")}</a></h2>""" else "") +
             "</body></html>"
+    }
+
+    /** API keys typed on the phone: trimmed with [SubSearchLogic.cleanKey]; blank fields are left out (they keep the stored key). */
+    fun toKeys(f: Map<String, String>): Map<String, String> =
+        listOf("tmdb", "omdb", "os", "sd").associateWith { SubSearchLogic.cleanKey(f[it].orEmpty()) }.filterValues { it.isNotEmpty() }
+
+    /** API keys: one form with the four keys, protected by the code like every other page. */
+    fun keysPage(li: Int): String {
+        fun t(a: String, b: String) = tr(li, a, b)
+        return """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IPVIO Stream</title><style>$CSS</style></head><body>
+<h1>${t("API-Schlüssel", "API keys")}</h1>
+<p>${t("Füge die Schlüssel hier ein, z. B. aus der Zwischenablage. Leere Felder lassen den gespeicherten Schlüssel unverändert.", "Paste the keys here, e.g. from the clipboard. Empty fields keep the stored key.")}</p>
+<form method="post" action="/keys">
+<input name="code" inputmode="numeric" maxlength="4" placeholder="${t("Code vom Fernseher", "Code from the TV")}" required>
+<h2>TMDB</h2><input name="tmdb" placeholder="${t("TMDB API-Schlüssel (v3)", "TMDB API key (v3)")}" autocapitalize="off" autocomplete="off" spellcheck="false">
+<h2>OMDb</h2><input name="omdb" placeholder="${t("OMDb API-Schlüssel", "OMDb API key")}" autocapitalize="off" autocomplete="off" spellcheck="false">
+<h2>OpenSubtitles</h2><input name="os" placeholder="${t("OpenSubtitles API-Schlüssel", "OpenSubtitles API key")}" autocapitalize="off" autocomplete="off" spellcheck="false">
+<h2>SubDL</h2><input name="sd" placeholder="${t("SubDL API-Schlüssel", "SubDL API key")}" autocapitalize="off" autocomplete="off" spellcheck="false">
+<button type="submit">${t("An den Fernseher senden", "Send to TV")}</button></form>
+<p>${t("Die Schlüssel gehören nur dir. Gib sie nicht weiter.", "The keys are yours alone. Do not share them.")}</p></body></html>"""
     }
 
     /** Transfer: download a backup (optionally with playlists) or restore a backup. */
@@ -140,6 +175,36 @@ button{width:100%;padding:14px;margin-top:10px;border:0;border-radius:10px;backg
         }
         return """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IPVIO Stream</title><style>$CSS</style></head><body>
 <h1>${t("Absturzbericht", "Crash report")}</h1>$body</body></html>"""
+    }
+
+    private fun traktWrap(title: String, body: String): String =
+        """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IPVIO Stream</title><style>$CSS</style></head><body>
+<h1>$title</h1>$body</body></html>"""
+
+    /** Trakt sign-in, step 1 on the phone: asks for the 4-digit code shown on the TV. */
+    fun traktCodePage(): String = traktWrap("Trakt sign-in",
+        """<form method="get" action="/trakt"><input name="code" inputmode="numeric" maxlength="4" placeholder="Code from the TV" required>
+<button type="submit">Continue</button></form>""")
+
+    /** Trakt sign-in, step 2: link to Trakt and a field for the copied "code|state" text. */
+    fun traktPage(authUrl: String, code: String): String {
+        val href = authUrl.replace("&", "&amp;").replace("\"", "&quot;")
+        return traktWrap("Sign in to Trakt",
+            """<p>1. Tap the button and sign in to Trakt.</p>
+<p><a href="$href">Sign in to Trakt</a></p>
+<p>2. Trakt sends you to a page with a code. Copy the whole text shown there (code|state) and paste it below.</p>
+<form method="post" action="/trakt"><input type="hidden" name="code" value="${code.filter { it.isDigit() }}">
+<textarea name="cb" rows="3" style="width:100%" placeholder="code|state" required></textarea>
+<button type="submit">Send to TV</button></form>""")
+    }
+
+    fun traktResult(text: String): String = traktWrap("Trakt", "<p>" + text.replace("&", "&amp;").replace("<", "&lt;") + "</p>")
+
+    fun traktOutcomeText(o: TraktAuth.Outcome): String = when (o) {
+        TraktAuth.Outcome.OK -> "Signed in to Trakt. You can go back to the TV."
+        TraktAuth.Outcome.NO_KEYSTORE -> "This device cannot store the sign-in securely, so nothing was saved."
+        TraktAuth.Outcome.NETWORK -> "Trakt could not be reached. Try again on the TV page."
+        TraktAuth.Outcome.REJECTED -> "The sign-in was not accepted. Start again from the TV page."
     }
 
     fun message(li: Int, kind: String): String {
@@ -183,12 +248,20 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
     var restore: ((String) -> Boolean)? = null
     /** Receives a TV guide (XMLTV) address typed on the phone; set = the field appears on the page. */
     var onEpg: ((String) -> Unit)? = null
+    /** Receives API keys typed on the phone (keys "tmdb", "omdb", "os", "sd"; only non-blank ones); set = the /keys page is active. Runs on the server thread, so the callback must post to the main thread itself. */
+    var onKeys: ((Map<String, String>) -> Unit)? = null
     /** Last crash report as text, null = none. */
     var crash: (() -> String?)? = null
     /** Phone search: answer a request under /api/<name> (JSON) or null = unknown. Set = the /r page is active. */
     var api: ((String, Map<String, String>) -> String?)? = null
     /** Import of an exported list file (file name, content); runs on the server thread, so the callback must post to the main thread itself. */
     var onList: ((String, ByteArray) -> Unit)? = null
+    /** WireGuard configuration sent from the phone (text, checked by [VpnLogic.check] before the callback); set = the section appears on the page. Runs on the server thread, so the callback must post to the main thread itself. */
+    var onVpn: ((String) -> Unit)? = null
+    /** Trakt sign-in (T-031): starts a sign-in on the TV and returns its authorize URL (null = not available). */
+    var traktStart: (() -> String?)? = null
+    /** Trakt sign-in (T-031): finishes it with the code and state from the phone. Runs on the server thread (network). */
+    var traktFinish: ((String, String) -> TraktAuth.Outcome)? = null
 
     fun start(): Boolean {
         if (server != null) return true
@@ -284,16 +357,40 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
         else -> { fails.set(0); 200 }
     }
 
+    /** Input stream that counts the bytes read, so [handle] knows how much of the body is still unread. */
+    private class CountingInput(private val inner: InputStream) : InputStream() {
+        var count = 0L
+            private set
+        override fun read(): Int = inner.read().also { if (it >= 0) count++ }
+        override fun read(b: ByteArray, off: Int, len: Int): Int = inner.read(b, off, len).also { if (it > 0) count += it }
+        override fun available(): Int = inner.available()
+    }
+
+    /** Skips up to [left] bytes (at most [MAX_DRAIN]); stops quietly on the end of the stream or a timeout. */
+    private fun drain(ins: InputStream, left: Long) {
+        if (left <= 0 || left > MAX_DRAIN) return
+        runCatching {
+            val buf = ByteArray(64 * 1024)
+            var rest = left
+            while (rest > 0) {
+                val r = ins.read(buf, 0, minOf(buf.size.toLong(), rest).toInt())
+                if (r < 0) break
+                rest -= r
+            }
+        }
+    }
+
     private class Reply(val status: Int, val body: ByteArray, val type: String = "text/html; charset=utf-8", val extra: String = "")
 
     private fun html(status: Int, s: String) = Reply(status, s.toByteArray(Charsets.UTF_8))
 
     private fun handle(s: Socket) {
         s.soTimeout = 15000
-        val ins = s.getInputStream()
+        val ins = CountingInput(s.getInputStream())
         val h = readHead(ins) ?: return
+        val afterHead = ins.count
         val li = PhoneImportLogic.langIndex(h.lang)
-        val feats = PhoneImportLogic.Features(saveUpload != null, backup != null, crash != null, onEpg != null, onList != null)
+        val feats = PhoneImportLogic.Features(saveUpload != null, backup != null, crash != null, onEpg != null, onList != null, onKeys != null, onVpn != null)
         val r: Reply = when (h.method + " " + h.path) {
             "GET /" -> html(200, PhoneImportLogic.page(li, feats))
             "POST /send" -> {
@@ -317,6 +414,21 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
                         val u = f["epg"].orEmpty().trim()
                         if (cb == null || !(u.startsWith("http://") || u.startsWith("https://"))) html(400, PhoneImportLogic.message(li, "bad"))
                         else { cb(u); html(200, PhoneImportLogic.message(li, "ok")) }
+                    }
+                    403 -> html(403, PhoneImportLogic.message(li, "code"))
+                    else -> html(c, PhoneImportLogic.message(li, "lock"))
+                }
+            }
+            // API keys typed on the phone (same code check as the other pages)
+            "GET /keys" -> if (onKeys != null) html(200, PhoneImportLogic.keysPage(li)) else html(404, PhoneImportLogic.message(li, "bad"))
+            "POST /keys" -> {
+                val f = PhoneImportLogic.parseForm(readSmall(ins, h.len) ?: "")
+                val cb = onKeys
+                when (val c = codeOk(f["code"])) {
+                    200 -> {
+                        val keys = PhoneImportLogic.toKeys(f)
+                        if (cb == null || keys.isEmpty()) html(400, PhoneImportLogic.message(li, "bad"))
+                        else { cb(keys); html(200, PhoneImportLogic.message(li, "ok")) }
                     }
                     403 -> html(403, PhoneImportLogic.message(li, "code"))
                     else -> html(c, PhoneImportLogic.message(li, "lock"))
@@ -350,6 +462,19 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
                     tmp.delete()
                     if (url == null) html(400, PhoneImportLogic.message(li, "file"))
                     else { onReceive(PhoneInput(url, "", "", "")); html(200, PhoneImportLogic.message(li, "ok")) }
+                }
+            }
+            // WireGuard configuration (body = the .conf file); checked here, so the phone shows an error at once
+            "POST /vpn" -> {
+                val cb = onVpn
+                val c = codeOk(h.query["code"])
+                if (cb == null) html(404, PhoneImportLogic.message(li, "bad"))
+                else if (c != 200) html(c, PhoneImportLogic.message(li, if (c == 403) "code" else "lock"))
+                else if (h.len <= 0 || h.len > VpnLogic.MAX_BYTES) html(400, PhoneImportLogic.message(li, "file"))
+                else {
+                    val text = String(readBody(ins, h.len), Charsets.UTF_8)
+                    if (VpnLogic.check(text) != null) html(400, PhoneImportLogic.message(li, "file"))
+                    else { cb(text); html(200, PhoneImportLogic.message(li, "ok")) }
                 }
             }
             "GET /transfer" -> if (backup != null) html(200, PhoneImportLogic.transferPage(li)) else html(404, PhoneImportLogic.message(li, "bad"))
@@ -389,6 +514,36 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
                     else -> html(c, PhoneImportLogic.message(li, "lock"))
                 }
             }
+            // Trakt sign-in (T-031): the TV starts it; the phone opens Trakt and sends back the "code|state" text
+            "GET /trakt" -> {
+                val start = traktStart
+                val given = h.query["code"]
+                if (start == null) html(404, PhoneImportLogic.message(li, "bad"))
+                else if (given == null) html(200, PhoneImportLogic.traktCodePage())
+                else when (val c = codeOk(given)) {
+                    200 -> {
+                        val url = start()
+                        if (url == null) html(503, PhoneImportLogic.traktResult("Trakt is not set up in this build."))
+                        else html(200, PhoneImportLogic.traktPage(url, given))
+                    }
+                    403 -> html(403, PhoneImportLogic.message(li, "code"))
+                    else -> html(c, PhoneImportLogic.message(li, "lock"))
+                }
+            }
+            "POST /trakt" -> {
+                val fin = traktFinish
+                val f = PhoneImportLogic.parseForm(readSmall(ins, h.len) ?: "")
+                if (fin == null) html(404, PhoneImportLogic.message(li, "bad"))
+                else when (val c = codeOk(f["code"])) {
+                    200 -> {
+                        val parsed = TraktLogic.parseCallback(f["cb"].orEmpty())
+                        if (parsed == null) html(400, PhoneImportLogic.traktResult("Paste the text from the helper page exactly: code|state."))
+                        else html(200, PhoneImportLogic.traktResult(PhoneImportLogic.traktOutcomeText(fin(parsed.first, parsed.second))))
+                    }
+                    403 -> html(403, PhoneImportLogic.message(li, "code"))
+                    else -> html(c, PhoneImportLogic.message(li, "lock"))
+                }
+            }
             "GET /r" -> if (api != null) html(200, RemoteLogic.page(li)) else html(404, PhoneImportLogic.message(li, "bad"))
             else -> {
                 val a = api
@@ -403,6 +558,9 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
                 } else html(404, PhoneImportLogic.message(li, "bad"))
             }
         }
+        // Read the rest of an unread body (e.g. a file sent with a wrong code): if the socket closes while the phone is
+        // still sending, the connection is reset and the browser shows only "Error" instead of the message.
+        drain(ins, h.len - (ins.count - afterHead))
         val out = s.getOutputStream()
         val reason = when (r.status) { 200 -> "OK"; 400 -> "Bad Request"; 403 -> "Forbidden"; 404 -> "Not Found"; 413 -> "Payload Too Large"; 429 -> "Too Many Requests"; else -> "Error" }
         out.write(("HTTP/1.1 ${r.status} $reason\r\nContent-Type: ${r.type}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n" +
@@ -416,8 +574,10 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
         /** Largest uploadable playlist file. */
         const val MAX_UPLOAD = 400L * 1024 * 1024
 
-        /** Largest uploadable list export (Letterboxd, MyAnimeList, Trakt); same limit as the file picker on the TV (ListImportUi). */
+        /** Largest uploadable list export (Letterboxd, MyAnimeList); same limit as the file picker on the TV (ListImportUi). */
         const val MAX_LIST_UPLOAD = 16L * 1024 * 1024
+        /** Largest unread body that is still read to the end before an error reply (larger ones: connection just closes). */
+        const val MAX_DRAIN = 64L * 1024 * 1024
 
         /** Local IPv4 address of the device in the Wi-Fi/LAN (or null). */
         fun localIp(): String? = runCatching {
@@ -429,4 +589,3 @@ class PhoneImport(private val onReceive: (PhoneInput) -> Unit) {
         }.getOrNull()
     }
 }
-

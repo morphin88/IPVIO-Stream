@@ -1,13 +1,20 @@
 package com.ipvio.stream
 
 import android.content.Context
+import android.widget.Toast
+import java.io.File
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -27,6 +34,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
@@ -59,9 +67,10 @@ private val CATS = listOf(
     Cat(AIcon.Lock, "Jugendschutz", "PIN, Inhalte ab 18"),
     Cat(AIcon.Storage, "Speicher", "Cache, Verlauf, Fortsetzen"),
     Cat(AIcon.Pulse, "Diagnose", "Status und Fehlersuche"),
-    Cat(AIcon.Download, "Listen importieren", "Letterboxd, MyAnimeList, Trakt"),
+    Cat(AIcon.Download, "Import & Trakt", "Letterboxd, MyAnimeList, Trakt"),
     Cat(AIcon.Live, "Boomer Mode", "Ganz einfach: große Kacheln zum Auswählen"),
     Cat(AIcon.Sliders, "Startseite anpassen", "Reihen und Widgets wählen und ordnen"),
+    Cat(AIcon.Live, "Sports Hub", "Sportarten, Wettbewerbe, Hinweise, Bereiche"),
     Cat(AIcon.Info, "Über IPVIO Stream", "Version, Quellen, Updates"),
     // Resets every settings tab at once (each tab 0..8 has its own reset for just that tab)
     Cat(AIcon.Warning, "Alles zurücksetzen", "Alle Einstellungen auf Standard"),
@@ -74,7 +83,9 @@ object SettingsNav {
     const val PROFILES = 10
     const val HOME = 17
     /** "Reset all settings" page; the donate page is always the last one (one after this). */
-    const val RESET_ALL = 19
+    const val RESET_ALL = 20
+    /** T-049d: Settings > Sports Hub. */
+    const val SPORT = 18
     var openPage by androidx.compose.runtime.mutableIntStateOf(-1)
 }
 
@@ -103,13 +114,14 @@ fun SettingsHub(onAdd: () -> Unit, reload: () -> Unit) {
                 Text("Einstellungen", color = Color.White, fontSize = spx(38), fontWeight = FontWeight.ExtraBold)
                 Text("Alles rund um Aussehen, Wiedergabe und Konto", color = Tok.TextLow, fontSize = spx(16))
             }
-            CATS.chunked(3).forEachIndexed { r, row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(dpx(16))) {
+            // T-050b: 4 columns and smaller tiles, so more settings areas are visible at once
+            CATS.chunked(4).forEachIndexed { r, row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(dpx(12))) {
                     row.forEachIndexed { c, cat ->
-                        val idx = r * 3 + c
+                        val idx = r * 4 + c
                         SettingsCard(cat, idx, Modifier.weight(1f).focusRequester(cardFocus[idx])) { last = idx; page = idx }
                     }
-                    repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                    repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
                 }
             }
         } else {
@@ -139,20 +151,21 @@ fun SettingsHub(onAdd: () -> Unit, reload: () -> Unit) {
                 4 -> MenuPage(ctx)
                 5 -> PlayerPage(ctx)
                 6 -> AudioPage(ctx)
-                7 -> FilterPage(ctx) { page = 9 }
+                7 -> FilterPage(ctx)
                 8 -> LivePage(ctx)
-                9 -> PlaylistPage(ctx, onAdd, reload)
+                9 -> PlaylistPage(ctx, onAdd, reload) { page = 7 }
                 10 -> ProfilesPage(ctx) { page = -1 }
                 11 -> ApiKeysPage(ctx)
                 12 -> ParentalPage(ctx) { page = -1 }
                 13 -> StoragePage(ctx)
                 14 -> DiagPage(ctx, reload)
-                16 -> BoomerPage(ctx) { page = -1 }
-                17 -> HomeLayoutPage(ctx)
                 15 -> ListImportPage(ctx)
+                16 -> BoomerPage(ctx) { page = -1 }
+                SettingsNav.HOME -> HomeLayoutPage(ctx)
+                SettingsNav.SPORT -> SportSettingsPage(ctx)
+                19 -> AboutPage(ctx)
                 SettingsNav.RESET_ALL -> ResetAllPage(ctx)
                 SettingsNav.RESET_ALL + 1 -> DonateSection(ctx)
-                else -> AboutPage(ctx)   // 18
             }
             // Every settings tab ends with a way back to the defaults. It resets only the settings of the tab that is open.
             if (SettingsResetLogic.hasReset(page)) {
@@ -161,7 +174,7 @@ fun SettingsHub(onAdd: () -> Unit, reload: () -> Unit) {
                     SettingsReset.page(ctx, page)
                     settingsToast(ctx, "Diese Seite wurde zurückgesetzt.")
                 }
-                Hint("Resets only the settings of this page to their defaults. All other pages stay unchanged. To reset everything at once, use Settings > Reset all.")
+                Hint("Setzt nur die Einstellungen dieser Seite auf die Standardwerte zurück. Alle anderen Seiten bleiben unverändert. Um alles auf einmal zurückzusetzen, nutze Einstellungen > Alles zurücksetzen.")
             }
             Spacer(Modifier.height(8.dp).bringIntoViewRequester(endReq))
             }
@@ -182,7 +195,7 @@ private fun SettingsCard(cat: Cat, idx: Int, modifier: Modifier, onClick: () -> 
     val shape = RoundedCornerShape(dpx(14))
     val (c1, c2, ink) = catColors(idx)
     Row(
-        modifier.height(dpx(96)).graphicsLayer { scaleX = s; scaleY = s }.clip(shape)
+        modifier.height(dpx(84)).graphicsLayer { scaleX = s; scaleY = s }.clip(shape)
             .background(Brush.horizontalGradient(listOf(c1, c2)))
             .border(if (f) 3.dp else 1.dp, if (f) Color.White else ink.copy(alpha = .22f), shape)
             .onFocusChanged { f = it.isFocused }
@@ -197,7 +210,7 @@ private fun SettingsCard(cat: Cat, idx: Int, modifier: Modifier, onClick: () -> 
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(dpx(3))) {
             Text(cat.title, color = Color.White, fontSize = spx(20), fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(cat.sub, color = Tok.TextMid, fontSize = spx(13), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(cat.sub, color = Tok.TextMid, fontSize = spx(13), maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
         AppIcon(AIcon.Right, Color.White, size = dpx(18))
     }
@@ -431,6 +444,16 @@ private fun ParentalPage(ctx: Context, onExit: () -> Unit) {
         3 -> PinPad("PIN bestätigen", "Gib die PIN noch einmal ein.", err,
             { if (it == first) { Parental.setPin(ctx, it); Parental.unlocked = true; err = null; step = 0 } else { err = "Die PINs stimmen nicht überein"; step = 2 } },
             { step = 0 })
+        5 -> PinPad("Aktuelle PIN eingeben", "Zum Ändern die bisherige PIN eingeben.", err,
+            { if (Parental.verify(ctx, it)) { err = null; step = 2 } else err = Parental.pinError() },
+            { err = null; step = 0 })
+        // Removing the PIN asks for the current PIN again, so it is protected like changing it
+        4 -> PinPad("PIN eingeben", "Die Jugendschutz-Einstellungen sind mit einer PIN geschützt.", err,
+            {
+                if (Parental.verify(ctx, it)) { Parental.clearPin(ctx); err = null; step = 0 }
+                else err = Parental.pinError()
+            },
+            { err = null; step = 0 })
         else -> {
             ToggleRow(
                 "Inhalte für Erwachsene ausblenden",
@@ -439,11 +462,19 @@ private fun ParentalPage(ctx: Context, onExit: () -> Unit) {
             ) { Parental.setHide(ctx, it) }
             if (Parental.hideAdult) Text("Der Schutz ist aktiv.", color = Accent2, fontSize = 15.sp)
             else Text(if (hiddenCount > 0) "$hiddenCount Einträge in deiner Playlist würden ausgeblendet." else "Kein Erwachsenen-Inhalt erkannt.", color = Muted, fontSize = 15.sp)
+            // Only adult content off the home pages; Live TV, categories and search keep it
+            if (!Parental.hideAdult) ToggleRow(
+                "Erwachsenen-Inhalte nie auf den Startseiten",
+                "Zeigt Titel und Sender für Erwachsene nie in den Reihen der Startseiten (Start, Filme, Serien), auch nicht unter „Zuletzt geschaut“ oder „Weiter schauen“. In Live TV, in den Kategorien und in der Suche bleiben sie erreichbar.",
+                Parental.homeHide
+            ) { Parental.setHomeHide(ctx, it) }
+            PrivateCatsSection(ctx)
             SectionTitle("PIN")
             Text(if (Parental.pinSet) "PIN ist gesetzt" else "Keine PIN gesetzt", color = if (Parental.pinSet) Accent2 else Muted, fontSize = 16.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                PillButton(if (Parental.pinSet) "PIN ändern" else "PIN festlegen", light = !Parental.pinSet) { err = null; step = 2 }
-                if (Parental.pinSet) ConfirmPill("PIN entfernen") { Parental.clearPin(ctx) }
+                // #82: changing an existing PIN asks for the current PIN first (step 5), like removing it
+                PillButton(if (Parental.pinSet) "PIN ändern" else "PIN festlegen", light = !Parental.pinSet) { err = null; step = if (Parental.pinSet) 5 else 2 }
+                if (Parental.pinSet) PillButton("PIN entfernen") { err = null; step = 4 }
             }
             Hint("Mit einer PIN lässt sich der Schutz nur nach Eingabe der PIN ändern. Die Erkennung arbeitet mit Stichwörtern in Kategorie- und Titelnamen und ist kein vollständiger Filter. Beim Zurücksetzen aller Einstellungen bleibt die PIN erhalten.")
         }
@@ -481,10 +512,13 @@ private fun GeneralPage(ctx: Context) {
     Hint("Diese Seite öffnet sich beim Start der App. Versteckte Menüpunkte sind nicht wählbar.")
     ToggleRow("Letzten Sender beim Start abspielen", "Wenn du zuletzt Live TV gesehen hast, läuft dieser Sender direkt nach dem Start.", General.resumeLive) { General.setResumeLive(ctx, it) }
     ToggleRow("Letzten Film / letzte Serie beim Start fortsetzen", "Wenn du zuletzt einen Film oder eine Serie gesehen hast, läuft sie nach dem Start an der gemerkten Stelle weiter (bei einer fertigen Folge mit der nächsten).", General.resumeVod) { General.setResumeVod(ctx, it) }
+    ToggleRow("Filme und Serien direkt zu den Kategorien", "„Filme“ und „Serien“ im Menü öffnen sofort die Kategorien statt der Startseite des Bereichs. Zurück führt zur Startseite des Bereichs.", General.vodCats) { General.setVodCats(ctx, it) }
 
     SectionTitle("Bedienung")
     ToggleRow("Tastatur des Geräts in der Suche", "Aus: die eingebaute Tastatur der App. An: die Tastatur deines Geräts (z. B. Gboard) mit allen Sprachen, Sprachfunktion und Einfügen. Mit OK auf das Suchfeld wird sie geöffnet.", AppSettings.systemKeyboard) { AppSettings.setSystemKeyboard(ctx, it) }
     ToggleRow("Beenden bestätigen", "Auf der Startseite muss „Zurück“ zweimal gedrückt werden, damit die App nicht aus Versehen schließt.", General.confirmExit) { General.setConfirmExit(ctx, it) }
+    // #95: the device's screensaver or sleep timer is blocked while the app is open (window flag, see ScreenAwake)
+    ToggleRow("Bildschirm beim Stöbern wach halten", "An: Der Fernseher geht nicht in den Bildschirmschoner oder Ruhezustand, solange die App offen ist. Aus: nur während der Wiedergabe.", General.keepAwakeBrowse) { General.setKeepAwakeBrowse(ctx, it) }
     // Phone/tablet: landscape (the UI is built for the TV)
     if (MobilePrefs.isMobile(ctx)) {
         val act = generateSequence<Context>(ctx) { (it as? android.content.ContextWrapper)?.baseContext }.filterIsInstance<android.app.Activity>().firstOrNull()
@@ -492,6 +526,8 @@ private fun GeneralPage(ctx: Context) {
             if (act != null) MobilePrefs.set(act, it)
         }
     }
+    DnsSection(ctx)
+    VpnSection(ctx)
 }
 
 internal fun canStartFromBoot(ctx: Context): Boolean =
@@ -529,7 +565,8 @@ private fun StoragePage(ctx: Context) {
     // Sizes and deleting run in the background: the metadata folder can contain tens of thousands of files
     var sizes by remember { mutableStateOf(List(General.AREAS.size) { 0L }) }
     LaunchedEffect(tick) { sizes = withContext(Dispatchers.IO) { General.AREAS.map { General.areaSize(ctx, it) } } }
-    SectionTitle("Zwischenspeicher")
+    SettingsTabs(listOf("Zwischenspeicher", "Verlauf", "Sicherung", "Downloads"), "storage") { tab ->
+    if (tab == 0) {
     General.AREAS.forEachIndexed { i, a ->
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             Column(Modifier.width(420.dp)) {
@@ -541,14 +578,17 @@ private fun StoragePage(ctx: Context) {
     }
     Text("Gesamt: " + SettingsLogic.fmtBytes(sizes.sum()), color = Accent2, fontSize = 15.sp)
     Hint("Geleerte Daten lädt die App bei Bedarf neu. Titel-Infos und Bilder erscheinen danach kurz später. Der Playlist-Zwischenspeicher macht den Start schnell; ohne ihn wartet die App auf den Download.")
-    SectionTitle("Verlauf")
+    }
+    if (tab == 1) {
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         ConfirmPill("Suchverlauf löschen") { AppSettings.clearSearch(ctx) }
         ConfirmPill("Zuletzt geschaut löschen") { General.clearHistory(ctx) }
         ConfirmPill("Weiterschauen löschen") { General.clearResume(ctx) }
     }
     Hint("Meine Liste und Favoriten bleiben immer erhalten.")
-    SectionTitle("Sicherung")
+    }
+    if (tab == 3) DownloadsSettings(ctx)
+    if (tab == 2) {
     var backupMsg by remember { mutableStateOf<String?>(null) }
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         PillButton("Sicherung erstellen") {
@@ -613,10 +653,12 @@ private fun StoragePage(ctx: Context) {
             catch (e: Exception) { backupMsg = "Auf diesem Gerät gibt es keine Dateiauswahl." }
         }
     }
-    backupMsg?.let { Text(it, color = Accent2, fontSize = 14.sp, modifier = Modifier.widthIn(max = 680.dp)) }
+    StatusLine(backupMsg, fontSize = 14.sp, modifier = Modifier.widthIn(max = 680.dp))
     Hint("„Speichern unter“ lässt dich den Ort wählen, zum Beispiel Google Drive, Downloads oder einen USB-Stick – so nimmst du die Sicherung auf ein anderes Gerät mit.")
     Hint("Gesichert werden Einstellungen, Favoriten, Verlauf, Weiterschauen und Profile. Playlists und Zugangsdaten sind nur in „Sicherung mit Playlists“ enthalten (die Datei enthält Passwörter, gib sie nicht weiter). Beim Wiederherstellen startet die App neu. Auf einem neuen Gerät geht das gleich beim Hinzufügen der ersten Playlist.")
     TransferSection(ctx)
+    }
+    }
 }
 
 @Composable
@@ -639,7 +681,8 @@ private fun MenuPage(ctx: Context) {
 
 @Composable
 private fun PlayerPage(ctx: Context) {
-    SectionTitle("Wiedergabe")
+    SettingsTabs(listOf("Wiedergabe", "Intro und nächste Folge", "Uhr im Bild", "Netzwerk und Bildrate", "Zusatzbild", "Quelle & Qualität"), "player") { tab ->
+    if (tab == 0) {
     val steps = listOf(5, 10, 15, 30, 60)
     val hides = listOf(3, 4, 5, 6, 8, 10, 15)
     SelectRow("Sprung links/rechts", "${AppSettings.seekStep} s", steps.map { "$it s" }, steps.indexOf(AppSettings.seekStep).coerceAtLeast(0)) {
@@ -656,7 +699,8 @@ private fun PlayerPage(ctx: Context) {
     ToggleRow("Endzeit anzeigen", "Zeigt, um wie viel Uhr der Film voraussichtlich endet.", AppSettings.showEndTime) {
         AppSettings.setPlayerExtra(ctx, AppSettings.autoNext, AppSettings.hideSec, it, AppSettings.autoSkipIntro)
     }
-    SectionTitle("Intro und nächste Folge")
+    }
+    if (tab == 1) {
     ToggleRow("Intro überspringen anbieten", "Zeigt bei Serien einen Knopf „Intro überspringen“, wenn Intro-Zeiten bekannt sind.", AppSettings.skipIntro) {
         AppSettings.setPlayer(ctx, it, AppSettings.showInfo, AppSettings.seekStep)
     }
@@ -669,7 +713,8 @@ private fun PlayerPage(ctx: Context) {
     ToggleRow("Abspann automatisch überspringen", "Startet die nächste Folge, sobald der Abspann beginnt. Geht nur, wenn für die Serie Abspann-Zeiten bekannt sind (TheIntroDB); sonst bleibt es beim Hinweis in den letzten 30 Sekunden.", AppSettings.autoSkipOutro) {
         AppSettings.setAutoOutro(ctx, it)
     }
-    SectionTitle("Uhr im Bild")
+    }
+    if (tab == 2) {
     if (AppSettings.clockOn) { Text("Vorschau", color = Muted, fontSize = 14.sp); ClockSample() }
     ToggleRow("Uhrzeit im Bild", "Zeigt die aktuelle Uhrzeit beim Abspielen in einer Ecke (nicht, solange die Steuerleiste offen ist).", AppSettings.clockOn) {
         AppSettings.setClock(ctx, it, AppSettings.clockPos, AppSettings.clockOpacity, AppSettings.clockSize)
@@ -698,7 +743,8 @@ private fun PlayerPage(ctx: Context) {
         }
         Hint("Die Uhr folgt der Zeitzone und dem 12/24-Stunden-Format aus den Einstellungen. Im Player geht es auch über Einstellungen > Uhrzeit.")
     }
-    SectionTitle("Netzwerk und Bildrate")
+    }
+    if (tab == 3) {
     val bufNames = listOf("Automatisch", "Normal", "Groß", "Sehr groß")
     SelectRow("Puffer (bei langsamem Internet)", bufNames[AppSettings.bufferMode], bufNames, AppSettings.bufferMode) { AppSettings.setBufferMode(ctx, it) }
     Hint("Ein größerer Puffer lädt mehr Film im Voraus und verhindert Ruckeln bei schwacher Leitung; dafür dauert der Start etwas länger und es wird mehr Speicher gebraucht. „Automatisch“ beginnt normal und vergrößert den Puffer von selbst, wenn es mehrfach ruckelt (aktuell Stufe ${AppSettings.bufferLearned}). Gilt ab dem nächsten gestarteten Titel.")
@@ -706,14 +752,19 @@ private fun PlayerPage(ctx: Context) {
         AppSettings.setAutoFps(ctx, it)
     }
     Hint("Intro-Zeiten stammen aus der Community-Datenbank TheIntroDB und gibt es nicht für jede Serie. Die Stream-Info erscheint nur bei Filmen und Serien.")
-    SectionTitle("Zusatzbild")
+    }
+    if (tab == 4) {
     DualPrefs.init(ctx)
     SelectRow("Anordnung", DualPrefs.ARRANGE_NAMES[DualPrefs.split], DualPrefs.ARRANGE_NAMES, DualPrefs.split) { DualPrefs.set(ctx, split = it) }
     SelectRow("Fenstergröße", DualPrefs.SIZE_NAMES[DualPrefs.size], DualPrefs.SIZE_NAMES, DualPrefs.size) { DualPrefs.set(ctx, size = it) }
     SelectRow("Position", DualPrefs.CORNER_NAMES[DualPrefs.corner], DualPrefs.CORNER_NAMES, DualPrefs.corner) { DualPrefs.set(ctx, corner = it) }
     Hint("Gilt für Bild-in-Bild. Deine Auswahl wird gespeichert.")
+    }
+    if (tab == 5) {
     SourceSettingsSection(ctx)
     DeadLinksSection(ctx)
+    }
+    }
 }
 
 @Composable
@@ -734,7 +785,8 @@ private fun DesignPage(ctx: Context) {
 
     // Space stays on the right for the preview
     Column(Modifier.padding(end = DesignPreview.WIDTH + 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-    SectionTitle("Fertige Designs")
+    SettingsTabs(listOf("Farbthema", "Hintergrund", "Animationen", "Anzeigegröße", "Bildschirm anpassen", "Schriftart"), "design") { tab ->
+    if (tab == 0) {
     Look.DESIGNS.chunked(3).forEach { row ->
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             row.forEach { d ->
@@ -797,7 +849,8 @@ private fun DesignPage(ctx: Context) {
         Hint("Farbe 1 färbt Knöpfe, Balken und markierte Flächen – die Schrift darauf wird automatisch hell oder dunkel, damit sie lesbar bleibt. Farbe 2 färbt Hervorhebungen, Rahmen und farbige Schrift. „Automatisch“ berechnet Farbe 2 passend zu Farbe 1.")
     }
 
-    SectionTitle("Hintergrund")
+    }
+    if (tab == 1) {
     Look.BGS.indices.chunked(2).forEach { row ->
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             row.forEach { i ->
@@ -808,6 +861,8 @@ private fun DesignPage(ctx: Context) {
         }
     }
 
+    }
+    if (tab == 2) {
     // Round 14: choice as fields (like the colors) – highlighting shows the effect in the preview, OK adopts it
     SectionTitle("Animationen")
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -815,7 +870,8 @@ private fun DesignPage(ctx: Context) {
             ChoiceChip(n, Look.motion == i, onFocus = { hover(it, Lang.tr(n)) { DesignPreview.motion = i } }) { save(motion = i) }
         }
     }
-    SectionTitle("Anzeigegröße")
+    }
+    if (tab == 3) {
     Look.SCALES.indices.chunked(3).forEach { row ->
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             row.forEach { i ->
@@ -830,13 +886,15 @@ private fun DesignPage(ctx: Context) {
     Hint("Standard ist 85 %: mehr Inhalt, Elemente bleiben gut lesbar. „Automatisch“ vergrößert die App auf sehr breiten Bildschirmen.")
     Hint("Animationen „Aus“ schaltet die Vergrößerung beim Fokus ab, „Dezent“ macht sie schwächer. Das schont schwache Geräte.")
 
-    SectionTitle("Bildschirm anpassen")
+    }
+    if (tab == 4) {
     var calibrate by remember { mutableStateOf(false) }
     PillButton("Bildschirmrand einstellen", light = true, icon = AIcon.Sliders) { calibrate = true }
     Hint("Zeigt einen Rahmen mit vier Ecken am Fernseher: Stelle den Rand ein, bis alle vier Ecken sichtbar sind. Hilft, wenn dein Fernseher Menü oder Texte am Rand abschneidet.")
     if (calibrate) FitCalibration { calibrate = false }
     ToggleRow("Uhr anzeigen", null, General.showClock) { General.setShowClock(ctx, it) }
-    SectionTitle("Schriftart")
+    }
+    if (tab == 5) {
     General.FONTS.indices.chunked(3).forEach { row ->
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             row.forEach { i ->
@@ -854,17 +912,19 @@ private fun DesignPage(ctx: Context) {
     }
     Hint("Fünf klare Systemschriften, die auf jedem Gerät vorhanden sind. Die Schriftgröße wirkt zusätzlich zur Anzeigegröße.")
     }
+    }
+    }
 }
 
-@Composable
-private fun DiagPage(ctx: Context, reload: () -> Unit) {
-    val cfg = LocalConfiguration.current
+/** Diagnostics report as label and value pairs (T-055). The TV page and the phone page both show it. */
+internal fun diagReportLines(ctx: Context): List<Pair<String, String>> {
+    val cfg = ctx.resources.configuration
     val items = PlaylistStore.channels
-    val counts = remember(items) { Triple(items.count { it.kind == Kind.LIVE }, items.count { it.kind == Kind.MOVIE }, items.count { it.kind == Kind.SERIES }) }
-    val version = remember { runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "?" }
+    val counts = Triple(items.count { it.kind == Kind.LIVE }, items.count { it.kind == Kind.MOVIE }, items.count { it.kind == Kind.SERIES })
+    val version = runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "?"
     val dens = ctx.resources.displayMetrics.density
     val err = Diag.lastError?.let { it + "  (" + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(Diag.lastErrorAt)) + ")" } ?: "keiner seit dem Start"
-    val lines = listOf(
+    return listOf(
         "Version" to version,
         "Installiert" to runCatching { DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime)) }.getOrDefault("?"),
         "Sprache" to (Lang.code() + " · Index " + Lang.index),
@@ -877,38 +937,57 @@ private fun DiagPage(ctx: Context, reload: () -> Unit) {
         "Speicher" to (Mem.totalMb(ctx).toString() + " MB · " + listOf("wenig", "mittel", "viel")[Mem.tier(ctx)]),
         "Letzter Fehler" to err,
         "Fehler seit Start" to Diag.errorCount.toString(),
+        "Log" to Diag.history.joinToString("\n") { DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(it.first)) + "  " + it.second },
         "Bildschirm wach" to (if (ScreenAwake.isOn) Lang.tr("an") + " (" + ScreenAwake.reasons + ")" else Lang.tr("aus")) +
             ScreenAwake.history.joinToString("") {
                 "\n" + DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(it.first)) + "  " +
                     (if (it.second == "aus") Lang.tr("aus") else Lang.tr("an") + it.second.removePrefix("an"))
             },
-        "Weiterschauen" to (ResumeLog.also { it.init(ctx) }.lines.take(12).joinToString("\n").ifBlank { "noch nichts gemerkt" }),
+        "Weiterschauen" to (ResumeLog.also { it.init(ctx) }.lines.take(12).joinToString("\n") { ResumeLog.display(it) }.ifBlank { "noch nichts gemerkt" }),
         "Letzter Absturz" to (CrashLog.last(ctx)?.let { it.first + "  (" + DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(it.second)) + ")" } ?: "keiner")
     )
-    lines.forEach { (k, v) ->
-        Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text(k, color = Muted, fontSize = 16.sp, modifier = Modifier.width(170.dp))
-            Text(v, color = Color.White, fontSize = 16.sp, modifier = Modifier.widthIn(max = 640.dp))
-        }
-    }
-    // Hint before the buttons: text below the last button never scrolls the list into view (nothing below is selectable)
-    Hint("Der Bericht enthält keine Adressen, Benutzernamen oder Passwörter. Er wird nur in die Zwischenablage kopiert und nirgendwohin gesendet.")
-    Hint("Auf dem Fernseher lässt sich die Zwischenablage oft nicht nutzen: Unter Einstellungen > Speicher > „Übertragung im WLAN starten“ kannst du den Bericht am Handy öffnen (Seite „Letzten Absturzbericht anzeigen“) und dort kopieren.")
+}
+
+@Composable
+private fun DiagPage(ctx: Context, reload: () -> Unit) {
+    val lines = diagReportLines(ctx)
+    // T-055: the buttons sit at the top. Below a long list the remote used to jump past every entry to the last button.
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        PillButton("Playlist neu laden", light = true, icon = AIcon.Refresh) { reload() }
         PillButton("Bericht kopieren") {
-            val text = lines.joinToString("\n") { it.first + ": " + it.second }
+            val text = lines.filter { it.first != "Log" || it.second.isNotEmpty() }.joinToString("\n") { it.first + ": " + it.second }
             runCatching {
                 val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
                 cm?.setPrimaryClip(android.content.ClipData.newPlainText("IPVIO Diagnose", text))
             }
         }
+        PillButton("Playlist neu laden", light = true, icon = AIcon.Refresh) { reload() }
     }
+    Hint("Der Bericht enthält keine Adressen, Benutzernamen oder Passwörter. Er wird nur in die Zwischenablage kopiert und nirgendwohin gesendet.")
+    Hint("Auf dem Fernseher lässt sich die Zwischenablage oft nicht nutzen: Unter Einstellungen > Speicher > „Übertragung im WLAN starten“ kannst du den Bericht am Handy öffnen (Seite „Letzten Absturzbericht anzeigen“) und dort kopieren.")
+    // T-055: every line of every entry is its own focusable row, so the remote steps through the log one entry at a time
+    lines.filter { it.first != "Log" || it.second.isNotEmpty() }.forEach { (k, v) ->
+        Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            Text(k, color = Muted, fontSize = 16.sp, modifier = Modifier.width(170.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                v.split("\n").forEach { line ->
+                    Text(line, color = Color.White, fontSize = 16.sp, modifier = Modifier.widthIn(max = 640.dp).focusable())
+                }
+            }
+        }
+    }
+}
+
+/** Text for the phone page (T-055): the last crash report if there is one, then the whole diagnostics report. */
+internal fun phoneDiagReport(ctx: Context): String {
+    // Labels in the language of the TV (T-055); values are the device's own texts
+    val crash = ImportFiles.crashText(ctx)?.takeIf { it.isNotBlank() }?.let { Lang.tr("Letzter Absturz") + "\n" + it + "\n\n" } ?: ""
+    return crash + diagReportLines(ctx).filter { it.first != "Log" || it.second.isNotEmpty() }.joinToString("\n") { Lang.tr(it.first) + ": " + it.second }
 }
 
 @Composable
 private fun AudioPage(ctx: Context) {
     TrackSettingsSection(ctx)
+    AudioLevelSettingsSection(ctx)
     // Round 14: subtitle style with live preview. Highlighting shows the effect immediately in the picture above, OK adopts it.
     Text("Untertitel-Stil", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
     var pSize by remember { mutableStateOf<Int?>(null) }
@@ -967,7 +1046,41 @@ private fun SubtitlePreview(size: Int, color: Int, bg: Int, edge: Int) {
 private val OUTLINE_OFFSETS = listOf(-1.5f to 0f, 1.5f to 0f, 0f to -1.5f, 0f to 1.5f, 1f to 1f, -1f to -1f, 1f to -1f, -1f to 1f)
 
 @Composable
-private fun FilterPage(ctx: Context, onLanguages: () -> Unit) {
+private fun FilterPage(ctx: Context) {
+    // Switches of the "groups" and "categories" tabs only change a draft; it is saved once with "Apply" (or when leaving
+    // the page), so the playlist is not filtered again after every single tick. The draft survives a change of tab.
+    IgnoredGroups.init(ctx)
+    val ver = IgnoredGroups.version
+    val base = remember(ver) { IgnoredGroups.snapshot() }
+    var draft by remember(base) { mutableStateOf(base) }
+    val d = IgnoreDraft(draft, draft != base, { draft = it }, { IgnoredGroups.applyDraft(ctx, draft - base, base - draft) }, { draft = base })
+    val latest by rememberUpdatedState(base to draft)
+    DisposableEffect(Unit) {
+        onDispose { val (b, dr) = latest; IgnoredGroups.applyDraft(ctx, dr - b, b - dr) }
+    }
+    // One place for everything that filters the playlist. The tabs, from the biggest cut to the smallest:
+    SettingsTabs(listOf("Sprachen der Inhalte", "Gruppen ignorieren", "Kategorien ein- und ausblenden", "Automatische Genres"), "filter") { tab ->
+        when (tab) {
+            0 -> {
+                Hint("1. What is loaded at all: languages you switch off are not read from the playlist, which saves memory and makes big playlists faster. Changing it loads the playlist again.")
+                LanguageFilterSection(ctx)
+            }
+            1 -> {
+                Hint("2. Hide whole bundles at once, by the tag of your provider (for example every category that starts with \"TR |\"). It works instantly, without reloading.")
+                IgnoredGroupsSection(d)
+            }
+            2 -> {
+                Hint("3. Hide single categories, or search for a name and switch all hits at once. It works instantly, without reloading. Groups and categories use the same hide list, so what you hide in either tab adds up.")
+                CategoryFilterSection(d)
+            }
+            else -> GenresFilterBlock(ctx)
+        }
+    }
+}
+
+/** Automatic genres (TMDB), as a tab of the filter page. */
+@Composable
+private fun GenresFilterBlock(ctx: Context) {
     ToggleRow("Automatische Genres", "Aus = Kategorien deines Anbieters (Standard). Umschalten geht auch direkt in der Ansicht „Kategorien“.", AppSettings.ipvioFilter) { AppSettings.set(ctx, it) }
     val all = PlaylistStore.channels
     val vod = remember(all) { all.count { it.kind != Kind.LIVE } }
@@ -975,11 +1088,25 @@ private fun FilterPage(ctx: Context, onLanguages: () -> Unit) {
     Hint("Automatische Genres sortieren Titel nach Genre (Anime = Animation aus Japan). Beim ersten Mal dauert das einige Minuten, danach ist alles gespeichert. Aus = die Kategorien deines Anbieters in der Reihenfolge deines Anbieters. In der Ansicht „Kategorien“ kannst du jederzeit zwischen beiden wechseln.")
     if (!MetaRepo.enabled()) Text("Automatische Genres brauchen einen TMDB-Schlüssel (Einstellungen > API-Schlüssel).", color = DS.Danger, fontSize = 15.sp)
     if (Classifier.running) Text("${Classifier.phase} werden geladen … ${Classifier.progress} / ${Classifier.total}", color = Accent2, fontSize = 15.sp)
-    SectionTitle("Sprachen der Inhalte")
-    Hint("Welche Sprachen geladen werden, stellst du unter „Playlists“ ein – das bestimmt, was aus der Playlist geladen wird.")
-    PillButton("Sprachen der Inhalte öffnen", icon = AIcon.Globe) { onLanguages() }
-    IgnoredGroupsSection(ctx)
-    CategoryFilterSection(ctx)
+}
+
+/** Unsaved "ignore" switches of the filter page, shared by both sections. */
+private class IgnoreDraft(
+    val keys: Set<String>,
+    val pending: Boolean,
+    val onEdit: (Set<String>) -> Unit,
+    val onApply: () -> Unit,
+    val onDiscard: () -> Unit,
+)
+
+@Composable
+private fun IgnoreDraftBar(d: IgnoreDraft) {
+    if (!d.pending) return
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        PillButton("Übernehmen", light = true, icon = AIcon.Check) { d.onApply() }
+        PillButton("Verwerfen") { d.onDiscard() }
+        Text(Lang.tr("Ignoriert") + ": " + d.keys.size, color = Muted, fontSize = 14.sp, raw = true)
+    }
 }
 
 /**
@@ -988,11 +1115,10 @@ private fun FilterPage(ctx: Context, onLanguages: () -> Unit) {
  * Each type is collapsed at first: a playlist can have hundreds of categories.
  */
 @Composable
-private fun CategoryFilterSection(ctx: Context) {
-    IgnoredGroups.init(ctx)
-    val ver = IgnoredGroups.version
-    val all = PlaylistStore.channels
-    val groups by produceState<Map<Kind, List<Pair<String, Int>>>>(emptyMap(), all.size, PlaylistStore.langCounts) {
+private fun CategoryFilterSection(d: IgnoreDraft) {
+    // Keyed on the unfiltered list: switching categories must not start a new count over the whole playlist
+    val rawAll = PlaylistStore.unfilteredChannels()
+    val groups by produceState<Map<Kind, List<Pair<String, Int>>>>(emptyMap(), rawAll, PlaylistStore.langCounts) {
         value = withContext(Dispatchers.Default) {
             val raw = PlaylistStore.unfilteredChannels()
             val out = LinkedHashMap<Kind, List<Pair<String, Int>>>()
@@ -1005,30 +1131,67 @@ private fun CategoryFilterSection(ctx: Context) {
         }
     }
     if (groups.values.all { it.isEmpty() }) return
-    SectionTitle("Kategorien ein- und ausblenden")
     Hint("Blende einzelne Kategorien aus oder schalte alle aus und nur die gewünschten wieder ein. Ausgeblendete Kategorien verschwinden sofort überall, ohne die Playlist neu zu laden.")
+    IgnoreDraftBar(d)
     val names = mapOf(Kind.MOVIE to "Filme", Kind.SERIES to "Serien", Kind.LIVE to "Live-TV")
+    // Search over all types (Wishbox), e.g. "EU | DE": switch all hits at once instead of hundreds of single ticks.
+    // Like every switch here it only changes the draft, so nothing is filtered again until "Apply".
+    var query by remember { mutableStateOf("") }
+    BackHandler(enabled = query.isNotEmpty()) { query = "" }
+    Field(query, { query = it }, "Kategorien suchen, z. B. EU | DE")
+    val hits = remember(groups, query) {
+        val m = GroupSearch.matcher(query)
+        if (m == null) null else groups.mapValues { (_, l) -> l.filter { m(it.first) } }
+    }
+    if (hits != null) { CategorySearchHits(hits, names, d); return }
     var open by remember { mutableStateOf<Kind?>(null) }
     for ((kind, list) in groups) {
         if (list.isEmpty()) continue
         val keys = remember(list) { list.map { IgnoredGroups.groupKey(kind, it.first) } }
-        val off = remember(keys, ver) { keys.count { IgnoredGroups.has(it) } }
+        val off = remember(keys, d.keys) { keys.count { it in d.keys } }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             PillButton(
                 Lang.tr(names.getValue(kind)) + ": " + (list.size - off) + " / " + list.size,
                 icon = if (open == kind) AIcon.Up else AIcon.Down, raw = true
             ) { open = if (open == kind) null else kind }
             if (open == kind) {
-                PillButton("Alle aus") { IgnoredGroups.setMany(ctx, keys, true) }
-                PillButton("Alle ein") { IgnoredGroups.setMany(ctx, keys, false) }
+                PillButton("Alle aus") { d.onEdit(d.keys + keys) }
+                PillButton("Alle an") { d.onEdit(d.keys - keys.toSet()) }
             }
         }
         if (open == kind) for ((g, n) in list) {
             val key = IgnoredGroups.groupKey(kind, g)
-            ToggleRow(g, n.toString() + " " + Lang.tr("Titel"), !IgnoredGroups.has(key)) { on -> IgnoredGroups.set(ctx, key, !on) }
+            ToggleRow(g, n.toString() + " " + Lang.tr("Titel"), key !in d.keys) { on -> d.onEdit(if (on) d.keys - key else d.keys + key) }
         }
     }
-    if (ver < 0) Spacer(Modifier.height(0.dp))
+}
+
+/** Rows shown for a category search; the bulk buttons still act on every hit. */
+private const val MAX_SEARCH_ROWS = 200
+
+/** Hits of the category search, grouped by type, with buttons that switch all hits in the draft at once. */
+@Composable
+private fun CategorySearchHits(hits: Map<Kind, List<Pair<String, Int>>>, names: Map<Kind, String>, d: IgnoreDraft) {
+    val keys = remember(hits) { hits.flatMap { (kind, l) -> l.map { IgnoredGroups.groupKey(kind, it.first) } } }
+    if (keys.isEmpty()) { Hint("Keine Kategorie gefunden."); return }
+    val off = remember(keys, d.keys) { keys.count { it in d.keys } }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        PillButton("Alle Treffer aus") { d.onEdit(d.keys + keys) }
+        PillButton("Alle Treffer ein") { d.onEdit(d.keys - keys.toSet()) }
+        Text(Lang.tr("Gefundene Kategorien") + ": " + keys.size + " · " + Lang.tr("Ignoriert") + ": " + off, color = Muted, fontSize = 14.sp, raw = true)
+    }
+    var shown = 0
+    for ((kind, list) in hits) {
+        if (list.isEmpty() || shown >= MAX_SEARCH_ROWS) continue
+        SectionTitle(names.getValue(kind))
+        for ((g, n) in list) {
+            if (shown >= MAX_SEARCH_ROWS) break
+            shown++
+            val key = IgnoredGroups.groupKey(kind, g)
+            ToggleRow(g, n.toString() + " " + Lang.tr("Titel"), key !in d.keys) { on -> d.onEdit(if (on) d.keys - key else d.keys + key) }
+        }
+    }
+    if (keys.size > shown) Hint("Es werden nicht alle Treffer angezeigt. Grenze die Suche genauer ein – „Alle Treffer“ gilt trotzdem für alle.")
 }
 
 /**
@@ -1036,12 +1199,10 @@ private fun CategoryFilterSection(ctx: Context) {
  * Switched-off bundles disappear everywhere, the playlist does not have to be reloaded for that. Complements the language filter.
  */
 @Composable
-private fun IgnoredGroupsSection(ctx: Context) {
-    IgnoredGroups.init(ctx)
-    val ver = IgnoredGroups.version
-    val all = PlaylistStore.channels
-    // Counting over the whole (unfiltered) list in the background
-    val stats by produceState<Map<Kind, List<Pair<String, Int>>>>(emptyMap(), all.size, PlaylistStore.langCounts) {
+private fun IgnoredGroupsSection(d: IgnoreDraft) {
+    // Counting over the whole (unfiltered) list in the background, keyed on that list (not on the filtered one)
+    val rawAll = PlaylistStore.unfilteredChannels()
+    val stats by produceState<Map<Kind, List<Pair<String, Int>>>>(emptyMap(), rawAll, PlaylistStore.langCounts) {
         value = withContext(Dispatchers.Default) {
             val raw = PlaylistStore.unfilteredChannels()
             val out = LinkedHashMap<Kind, List<Pair<String, Int>>>()
@@ -1053,13 +1214,13 @@ private fun IgnoredGroupsSection(ctx: Context) {
             out
         }
     }
-    SectionTitle("Gruppen ignorieren")
     Hint("Titel und Sender sind nach der Kennung deines Anbieters gebündelt (z. B. „TR |“, „[EN]“, „AR:“). Schalte Bündel aus, die du nicht brauchst: Sie verschwinden sofort überall, ohne die Playlist neu zu laden. Ausgeschaltet heißt ignoriert. Hilft dort, wo der Sprachfilter eine Kennung nicht erkennt.")
     if (stats.isEmpty() || stats.values.all { it.isEmpty() }) { Hint("Noch keine Playlist geladen."); return }
-    if (!IgnoredGroups.isEmpty) {
+    IgnoreDraftBar(d)
+    if (d.keys.isNotEmpty()) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            PillButton("Alle wieder einschalten", icon = AIcon.Check) { IgnoredGroups.clear(ctx) }
-            Text(Lang.tr("Ignoriert") + ": " + IgnoredGroups.size, color = Muted, fontSize = 14.sp, raw = true)
+            PillButton("Alle wieder einschalten", icon = AIcon.Check) { d.onEdit(emptySet()) }
+            if (!d.pending) Text(Lang.tr("Ignoriert") + ": " + d.keys.size, color = Muted, fontSize = 14.sp, raw = true)
         }
     }
     val names = mapOf(Kind.MOVIE to "Filme", Kind.SERIES to "Serien", Kind.LIVE to "Live-TV")
@@ -1071,11 +1232,10 @@ private fun IgnoredGroupsSection(ctx: Context) {
             ToggleRow(
                 if (tag.isEmpty()) "Ohne Kennung" else tag,
                 n.toString() + " Titel",
-                !IgnoredGroups.has(key)
-            ) { on -> IgnoredGroups.set(ctx, key, !on) }
+                key !in d.keys
+            ) { on -> d.onEdit(if (on) d.keys - key else d.keys + key) }
         }
     }
-    if (ver < 0) Spacer(Modifier.height(0.dp))
 }
 
 /**
@@ -1102,7 +1262,6 @@ private fun LanguageFilterSection(ctx: Context) {
         big = !PlaylistStore.fits(draft)
         LangFilter.setAndApply(ctx, draft)
     }
-    SectionTitle("Sprachen der Inhalte")
     Hint("Blende Sprachen aus, die du nicht brauchst – sie verschwinden dann überall: Startseite, Filme, Serien, Live-TV und Suche. Erkannt wird die Kennzeichnung deines Anbieters (z. B. „DE |“, „[TR]“, „GERMAN“). Das ist bei IPTV-Anbietern die Sprache der Tonspur, nicht das Herkunftsland des Films.")
     if (list.isEmpty()) { Hint("Noch keine Playlist geladen."); return }
     Hint("Ausgeblendete Sprachen werden gar nicht erst geladen. Das spart viel Arbeitsspeicher und macht große Playlists schneller.")
@@ -1152,7 +1311,11 @@ private fun LivePage(ctx: Context) {
     Text("TV-Programm (EPG)", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
     Text("Programm bei $xtream von ${counts.first} Sendern möglich", color = Muted, fontSize = 15.sp)
     Text("XMLTV: ${Xmltv.status}", color = Accent2, fontSize = 15.sp)
+    ToggleRow("Genre-Kategorien in Live TV", "Sport, Filme, Dokumentationen, Kinder, Nachrichten und Musik stehen vor den Kategorien deines Anbieters. Aus = nur die Kategorien deines Anbieters, in seiner Reihenfolge, direkt nach „Alle Sender“.", LiveSettings.genres) { LiveSettings.setGenres(ctx, it) }
     ToggleRow("Sender-Qualitäten bündeln", "Derselbe Sender in 8K, 4K, FHD, HD und SD erscheint als eine Zeile. OK startet die beste Qualität, die anderen wählst du im Menü des Senders (OK gedrückt halten).", General.bundleLive) { General.setBundleLive(ctx, it) }
+    val rowSizes = listOf("Klein", "Normal", "Groß")
+    SelectRow("Senderzeilen", rowSizes[General.channelRowSize], rowSizes, General.channelRowSize) { General.setChannelRowSize(ctx, it) }
+    Hint("Kleinere Zeilen zeigen mehr Sender auf einmal, das hilft auf großen Fernsehern. Größere Zeilen lassen sich aus der Ferne leichter lesen.")
     Hint("Die App sucht die Programmdaten automatisch (Xtream-Schnittstelle oder XMLTV-Adresse aus der Playlist). Wenn dein Anbieter eine eigene XMLTV-Adresse nennt, trage sie hier ein.")
     Field(url, { url = it }, "https://…/xmltv.php?username=…&password=…")
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1168,22 +1331,18 @@ private fun LivePage(ctx: Context) {
     ChannelListsSection(ctx)
     CatchupSection()
     LiveBufferSection(ctx)
+    PlayerButtonsSection(ctx)   // T-062
     ReminderSettingsSection(ctx)
 }
 
 @Composable
-private fun PlaylistPage(ctx: Context, onAdd: () -> Unit, reload: () -> Unit) {
+private fun PlaylistPage(ctx: Context, onAdd: () -> Unit, reload: () -> Unit, onFilter: () -> Unit) {
     val scope = rememberCoroutineScope()
+    // Index of the playlist in the edit window (-1 = closed)
     var editing by remember { mutableIntStateOf(-1) }
-    var name by remember { mutableStateOf("") }
-    // Editing the backup servers of an Xtream playlist
-    var editingB by remember { mutableIntStateOf(-1) }
-    var backups by remember { mutableStateOf(backupList(emptyList())) }
-    var backupErr by remember { mutableStateOf<String?>(null) }
     PlaylistStore.savedUrl(ctx)
     if (Secrets.plainFallback) Hint("Dieses Gerät hat keinen sicheren Schlüsselspeicher: Playlist-Adressen mit Zugangsdaten werden unverschlüsselt gespeichert.")
     Text("Meine Playlists (${PlaylistStore.lists.size})", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-    if (PlaylistStore.lists.size > 1) Hint("Die Hauptliste ist die Playlist, mit der die App arbeitet. „Zusätzlich anzeigen“ blendet eine weitere Playlist dazu ein; sie ersetzt die Hauptliste nicht.")
     PlaylistStore.lists.forEachIndexed { i, pl ->
         val isActive = i == PlaylistStore.active
         val shown = PlaylistStore.isShown(i)
@@ -1193,70 +1352,56 @@ private fun PlaylistPage(ctx: Context, onAdd: () -> Unit, reload: () -> Unit) {
         ) {
             Column(Modifier.weight(1f)) {
                 Text(pl.name + if (isActive) "  ·  " + Lang.tr("Hauptliste") else if (shown) "  ·  " + Lang.tr("zusätzlich angezeigt") else "", color = if (isActive || shown) Accent2 else Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, raw = true)
-                Text(PlaylistStore.hostOf(pl.url), color = Muted, fontSize = 13.sp, maxLines = 1)
-                val nb = if (editingB == i) 0 else PlaylistStore.backups(ctx, pl.url).size
+                // Source type and content mode, visible without opening the edit window (a "Live TV only" list has no movies)
+                val srcType = when { StalkerLogic.parse(pl.url) != null -> "Stalker"; XtreamLogic.fromUrl(pl.url) != null -> "Xtream"; else -> "M3U" }
+                val plMode = PlaylistMode.version.let { PlaylistMode.get(ctx, pl.url) }   // version: redraw after a change
+                Text(PlaylistStore.hostOf(pl.url) + "  ·  " + srcType + (if (plMode != PlaylistMode.ALL) "  ·  " + Lang.tr(PlaylistMode.labels[plMode]) else ""),
+                    color = if (plMode != PlaylistMode.ALL) Accent2 else Muted, fontSize = 13.sp, maxLines = 1, raw = true)
+                // #111: channels, movies and series of this playlist as last loaded (nothing until it is loaded once)
+                PlaylistStore.typeCounts(ctx, pl.url)?.let { t ->
+                    Text(PlaylistCountLogic.summary(t, Lang.tr("Live TV"), Lang.tr("Filme"), Lang.tr("Serien")), color = Muted, fontSize = 13.sp, maxLines = 1)
+                }
+                val nb = PlaylistStore.backups(ctx, pl.url).size
                 if (nb > 0) Text("Backup-Server: $nb", color = Muted, fontSize = 13.sp, maxLines = 1)
                 val down = PlaylistStore.downServers(ctx, pl.url)
                 if (down.isNotEmpty()) Text("Nicht erreichbar: " + down.joinToString(", "), color = Color(0xFFFF8A80), fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
-            if (!isActive) SmallPill(if (shown) "Nicht mehr zusätzlich anzeigen" else "Zusätzlich anzeigen") {
-                PlaylistStore.setShown(ctx, i, !shown)
-                scope.launch { PlaylistStore.applyMulti(ctx) }
+            // Reload and Edit; everything else is in the edit window (T-048)
+            if (PlaylistStore.reloadingOther == pl.url) Text("Wird neu geladen …", color = Accent2, fontSize = 14.sp)
+            // Download this playlist again (the main list is reloaded where it is; another one is refreshed in the background)
+            // Content mode not "all": one press loads movies and series again (same steps as "Apply" in the edit window)
+            if (PlaylistMode.version.let { PlaylistMode.get(ctx, pl.url) } != PlaylistMode.ALL) SmallPill("Alle Inhalte zeigen") {
+                PlaylistMode.set(ctx, pl.url, PlaylistMode.ALL)
+                if (isActive) PlaylistStore.modeChanged(ctx)
+                else PlaylistStore.reloadOtherAsync(ctx, i)
             }
-            if (!isActive) SmallPill("Zur Hauptliste machen") {
-                PlaylistStore.activate(ctx, i)
-                scope.launch { PlaylistStore.load(ctx, pl.url, false) }
-            }
-            // Content mode (Wishbox): Live TV + VOD / Live TV only / VOD only, cycles on OK
-            val mode = remember(PlaylistMode.version, pl.url) { PlaylistMode.get(ctx, pl.url) }
-            SmallPill(PlaylistMode.labels[mode]) {
-                PlaylistMode.set(ctx, pl.url, (mode + 1) % PlaylistMode.labels.size)
-                // Parsed again from the stored list without network (the mode is applied while loading, saves memory)
-                scope.launch { if (!PlaylistStore.reapplyLanguages(ctx)) PlaylistStore.applyMode(ctx) }
-            }
-            SmallPill("Umbenennen") { editing = i; name = pl.name }
-            if (XtreamLogic.fromUrl(pl.url) != null) SmallPill("Backup-Server") {
-                val b = PlaylistStore.backups(ctx, pl.url)
-                editingB = i; backups = backupList(b); backupErr = null
-            }
-            SmallPill("Löschen") {
-                val wasActive = isActive
-                editingB = -1
-                PlaylistStore.remove(ctx, i)
-                if (PlaylistStore.lists.isEmpty()) onAdd()
-                else if (wasActive) {
-                    val u = PlaylistStore.lists[PlaylistStore.active].url
-                    scope.launch { PlaylistStore.load(ctx, u, false) }
-                }
-            }
+            SmallPill("Neu laden", icon = AIcon.Refresh) { if (isActive) reload() else PlaylistStore.reloadOtherAsync(ctx, i) }
+            SmallPill("Bearbeiten") { editing = i }
         }
     }
-    if (PlaylistStore.lists.size > 1) Hint("„Zusätzlich anzeigen“ zeigt eine Playlist zusätzlich zur aktiven: Filme und Serien erscheinen zusammen (doppelte Filme nur einmal, gleiche Serien als eine Serie mit mehreren Quellen). In Filme und Serien filterst du über „Quelle“, im Live TV wechselst du die Quelle mit dem Knopf oben. Jede weitere Playlist braucht zusätzlich Speicher.")
     PlaylistStore.extraError?.let { Text(it, color = Color(0xFFFF8A80), fontSize = 15.sp) }
-    if (editing >= 0) {
-        Field(name, { name = it }, "Name der Playlist")
-        PillButton("Name speichern", light = true) { PlaylistStore.rename(ctx, editing, name); editing = -1 }
-    }
-    if (editingB in PlaylistStore.lists.indices) {
-        XtreamLogic.fromUrl(PlaylistStore.lists[editingB].url)?.base?.let { main ->
-            Text("Hauptserver: $main", color = Color.White, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            HostHealthLine(main)
-        }
-        BackupFields(backups)
-        PillButton("+ Backup-Server") { backups.add("") }
-        Hint(BACKUP_HINT)
-        backupErr?.let { Text(it, color = Color(0xFFFF8A80), fontSize = 15.sp) }
-        PillButton("Backup-Server speichern", light = true) {
-            if (!backupsValid(backups)) backupErr = BACKUP_INVALID
-            else { PlaylistStore.setBackups(ctx, PlaylistStore.lists[editingB].url, backups.toList()); editingB = -1 }
-        }
-    }
+    if (editing in PlaylistStore.lists.indices) PlaylistEditDialog(ctx, editing, scope, onAdd) { editing = -1 }
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         PillButton("+ Weitere Playlist hinzufügen", light = true) { onAdd() }
         PillButton("Aktive Playlist neu laden", icon = AIcon.Refresh) { reload() }
     }
-    LanguageFilterSection(ctx)
+    PlaylistStore.refreshError?.let { Text(Lang.tr("Aktualisierung fehlgeschlagen: {0}").replace("{0}", Lang.tr(it)), color = DS.Danger, fontSize = 15.sp, raw = true) }
+    // Stored list broken or incomplete (e.g. a cut-off download): forget everything stored and download it again
+    if (PlaylistStore.lists.isNotEmpty()) {
+        ConfirmPill("Playlist komplett neu laden") { scope.launch { PlaylistStore.reloadFromScratch(ctx) } }
+        Hint("Discards everything stored for the active playlist and downloads it again from the provider. Helps when categories or channels are missing. Name, backup servers and language selection are kept.")
+    }
+    // The language filter lives on the filter page now (Genres & categories), together with the other filters
+    SectionTitle("Sprachen der Inhalte")
+    Hint("Which languages are loaded, and which groups and categories are hidden, is set on the page Genres & categories.")
+    SectionTitle("Serien")
+    ToggleRow("Staffeln zusammenfassen", "Manche Anbieter führen jede Staffel als eigene Serie („Show S01“, „Show S02“). Ein: diese Staffeln erscheinen als eine Serie. Gilt für Xtream-Playlists. Verlauf und „Meine Liste“ dieser Serien beginnen neu; die alten Einträge bleiben erhalten, wenn du es wieder ausschaltest.", AppSettings.mergeSeasons) {
+        AppSettings.setMergeSeasons(ctx, it)
+        LangFilter.setAndApply(ctx, LangFilter.hidden)   // read the stored list again with the new option
+    }
+    PillButton("Sprachen der Inhalte öffnen", icon = AIcon.Globe) { onFilter() }
     SectionTitle("Automatisch aktualisieren")
+    Hint("Gilt für alle Playlists ohne eigenen Plan. Einen eigenen Plan stellst du bei „Bearbeiten“ einer Playlist ein.")
     val modes = listOf("Bei jedem Start", "Alle paar Stunden", "Täglich", "Wöchentlich", "Nur von Hand")
     SelectRow("Playlist aktualisieren", modes[General.refreshMode], modes, General.refreshMode) { General.setPlan(ctx, mode = it) }
     if (General.refreshMode == 1) {
@@ -1354,6 +1499,17 @@ private fun ApiKeysPage(ctx: Context) {
     var osStatus by remember { mutableStateOf("") }
     var sdStatus by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
+    // Phone entry first: the button must be visible without scrolling (its QR block appears right below it)
+    ApiKeysPhoneEntry(ctx) { got ->
+        // Keep the keys the phone did not send, store the rest; "Speichern und prüfen" then checks them as usual
+        got["tmdb"]?.let { tmdb = Config.clean(it); tmdbStatus = "" }
+        got["omdb"]?.let { omdb = Config.clean(it); omdbStatus = "" }
+        got["os"]?.let { osKey = it; osStatus = "" }
+        got["sd"]?.let { sdKey = it; sdStatus = "" }
+        Config.save(ctx, tmdb, omdb)
+        Config.saveSubs(ctx, osKey, sdKey)
+        tmdb = Config.ownTmdb(ctx); omdb = Config.ownOmdb(ctx); osKey = Config.OS_KEY; sdKey = Config.SD_KEY
+    }
     Hint("Die App enthält keine eigenen Schlüssel. Mit deinen eigenen, kostenlosen Schlüsseln zeigt sie Poster, Beschreibungen, Besetzung, Trailer, automatische Genres sowie IMDb- und Rotten-Tomatoes-Wertungen. Ohne Schlüssel übernimmt sie Beschreibung, Cover und Bewertung von deinem Anbieter (bei Xtream-Zugängen).")
 
     SectionTitle("TMDB (Film-Infos)")
@@ -1398,6 +1554,49 @@ private fun ApiKeysPage(ctx: Context) {
     }
 }
 
+/**
+ * "Enter on phone" for the API keys: reuses the local phone server ([PhoneImport]) with its /keys page.
+ * [onKeys] runs on the main thread with the non-blank keys ("tmdb", "omdb", "os", "sd").
+ */
+@Composable
+private fun ApiKeysPhoneEntry(ctx: Context, onKeys: (Map<String, String>) -> Unit) {
+    var serving by remember { mutableStateOf(false) }
+    var received by remember { mutableStateOf(false) }
+    val ip = remember { PhoneImport.localIp() }
+    val latest by rememberUpdatedState(onKeys)
+    val server = remember {
+        PhoneImport { }.apply {
+            this.onKeys = { keys ->
+                android.os.Handler(android.os.Looper.getMainLooper()).post { latest(keys); received = true }
+            }
+        }
+    }
+    DisposableEffect(Unit) { onDispose { server.stop() } }
+    // One button for both states, so it keeps the focus (swapping it for another block lost the focus and opened the sidebar)
+    PillButton(if (serving) "Eingabe am Handy beenden" else "Am Handy eingeben", icon = AIcon.Phone) {
+        if (serving) { server.stop(); serving = false } else { received = false; serving = server.start() }
+    }
+    if (serving) {
+        Column(
+            Modifier.clip(RoundedCornerShape(DS.RadiusM)).background(Color(0x14FFFFFF)).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (ip == null) Text("Das Gerät ist nicht mit einem WLAN verbunden.", color = Color(0xFFFFB86B), fontSize = 16.sp)
+            else {
+                Text("Am Handy (im selben WLAN) öffnen:", color = Muted, fontSize = 15.sp)
+                val addr = "http://$ip:${server.port}/keys"
+                Text(addr, color = Accent2, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, raw = true)
+                QrWithLabel(addr)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Code", color = Muted, fontSize = 16.sp)
+                    Text(server.code, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, raw = true)
+                }
+                if (received) StatusLine("Schlüssel vom Handy erhalten und gespeichert. Jetzt „Speichern und prüfen“ drücken.")
+            }
+        }
+    }
+}
+
 @Composable
 private fun AboutPage(ctx: Context) {
     Text("IPVIO Stream · Version " + appVersion(ctx), color = Color.White, fontSize = 18.sp)
@@ -1425,9 +1624,9 @@ private fun settingsToast(ctx: Context, message: String) {
 @Composable
 private fun ResetAllPage(ctx: Context) {
     var ask by remember { mutableStateOf(false) }
-    Hint("Resets all settings to their defaults: view, design, menu, player, sound, genres, Live TV and more. Playlists, favorites, history, resume positions and the parental-control PIN are kept. Clear the cache under Storage.")
+    Hint("Setzt alle Einstellungen auf die Standardwerte zurück: Ansicht, Design, Menü, Player, Ton, Genres, Live TV und mehr. Playlists, Favoriten, Verlauf, Fortsetzen-Positionen und die PIN der Kindersicherung bleiben erhalten. Den Cache leerst du unter Speicher.")
     PillButton("Alle Einstellungen zurücksetzen", light = true, icon = AIcon.Warning) { ask = true }
-    Hint("Reset just one page? Every settings page has its own reset button at the bottom.")
+    Hint("Nur eine Seite zurücksetzen? Jede Einstellungsseite hat unten ihren eigenen Zurücksetzen-Knopf.")
     if (ask) ResetAllDialog(onCancel = { ask = false }) {
         ask = false
         SettingsReset.all(ctx)
@@ -1473,7 +1672,6 @@ private fun UpdateSection(ctx: Context) {
     val scope = rememberCoroutineScope()
     Text("Installiert: Version " + AppUpdate.currentName(ctx), color = Muted, fontSize = 16.sp)
     ToggleRow("Automatisch nach Updates suchen", "Einmal am Tag. Ein neues Update erscheint in der Glocke oben rechts.", auto) { auto = it; AppUpdate.setAuto(ctx, it) }
-    Hint("Die Schlüssel bleiben nur auf diesem Gerät. Nach dem Eintragen die App einmal neu starten, damit alle Bereiche die Infos laden. Intro- und Abspann-Zeiten kommen von TheIntroDB und brauchen keinen Schlüssel.")
     // Buttons last: text below the last focusable element was cut off at the bottom of the page
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         PillButton(if (busy) "Bitte warten …" else "Jetzt nach Update suchen") {
@@ -1494,9 +1692,37 @@ private fun UpdateSection(ctx: Context) {
             }
         }
     }
-    if (status.isNotBlank()) Text(status, color = Muted, fontSize = 16.sp)
+    StatusLine(status, color = Muted)
     Hint("Updates kommen von der Projektseite auf GitHub. Deine Playlists, Favoriten, der Verlauf und die Einstellungen bleiben bei einem Update erhalten. Android fragt vor der Installation einmal nach.")
     var url by remember { mutableStateOf(AppUpdate.url(ctx).takeIf { it != AppUpdate.DEFAULT_URL }.orEmpty()) }
     Field(url, { url = it; AppUpdate.setUrl(ctx, it) }, "Eigene Update-Adresse (leer = GitHub)")
 }
 
+
+/** Private categories (T-028): list with "Nicht mehr privat" and the switch for parental-flagged categories. */
+@Composable
+private fun PrivateCatsSection(ctx: Context) {
+    PrivateCats.init(ctx)
+    SectionTitle("Private Kategorien")
+    Hint("Titles from a private category only show inside that category: not in history, continue watching, \"All …\", genres, search or the home pages. Make a category private in Live TV, Movies or Series with the menu key (or a long OK) on the category.")
+    ToggleRow(
+        "Jugendschutz-Kategorien immer privat",
+        "Alles, was der Jugendschutz erkennt, wird wie eine private Kategorie behandelt.",
+        PrivateCats.parental
+    ) { PrivateCats.setParental(ctx, it) }
+    val v = PrivateCats.version
+    val keys = remember(v) { PrivateCats.keys.toList() }
+    if (keys.isEmpty()) Text("Keine privaten Kategorien.", color = Muted, fontSize = 15.sp)
+    else Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        for (k in keys) {
+            val i = k.indexOf('\t')
+            val kind = if (i > 0) runCatching { Kind.valueOf(k.substring(0, i)) }.getOrNull() else null
+            val group = if (i > 0) k.substring(i + 1) else k
+            val kindLabel = when (kind) { Kind.LIVE -> "Live TV"; Kind.MOVIE -> "Filme"; Kind.SERIES -> "Serien"; null -> "" }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(Lang.tr(kindLabel) + "  ·  " + group, color = Color.White, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 560.dp))
+                if (kind != null) SmallPill("Nicht mehr privat") { privateToggle(ctx, kind, group) }
+            }
+        }
+    }
+}

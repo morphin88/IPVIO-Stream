@@ -9,10 +9,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import okhttp3.Call
@@ -63,12 +66,42 @@ object PlaylistStore {
      */
     private fun setItems(l: List<Item>, shown: List<Item>? = null) {
         LibMatch.reset()
-        filtered = shown ?: shownOf(l); filteredFor = l; filteredVer = filterVer()
+        filtered = shown ?: shownOf(l); filteredFor = l; filteredVer = filterVer(); filteredBase = baseVer()
         rawChannels = l
     }
 
     /** State of the filters (parental control, "hide broken titles"): when it changes, the shown list is rebuilt. */
     private fun filterVer(): Int = Parental.version * 10_000 + (if (DeadLinks.hide) DeadLinks.version else 0) + IgnoredGroups.version * 1_000_000
+
+    /** Filter state without the "ignore" part: a change here (e.g. parental control) is applied at once. */
+    private fun baseVer(): Int = Parental.version * 10_000 + (if (DeadLinks.hide) DeadLinks.version else 0)
+
+    /** Increased when a background refilter has finished, so readers of [channels] see the new list. */
+    private var refilterTick by mutableIntStateOf(0)
+    @Volatile private var filteredBase = -1
+    @Volatile private var pendingVer = -1
+    private var refilterJob: Job? = null
+    private val refilterScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Only the "ignore" filter changed (categories or bundles switched in settings): filter the whole list in the background
+     * instead of on the main thread while drawing. Until it is done, readers keep the previous list.
+     */
+    @Synchronized private fun refilterLater(raw: List<Item>, ver: Int) {
+        if (pendingVer == ver) return
+        pendingVer = ver
+        refilterJob?.cancel()
+        refilterJob = refilterScope.launch {
+            val r = shownOf(raw)
+            withContext(Dispatchers.Main) {
+                if (rawChannels === raw && filterVer() == ver) {
+                    filtered = r; filteredFor = raw; filteredVer = ver; filteredBase = baseVer()
+                    refilterTick++
+                }
+                if (pendingVer == ver) pendingVer = -1
+            }
+        }
+    }
 
     private fun shownOf(l: List<Item>): List<Item> {
         var r = if (Parental.hideAdult) Parental.filter(l) else l
@@ -94,9 +127,15 @@ object PlaylistStore {
         get() {
             val raw = rawChannels
             val ver = filterVer()
+            @Suppress("UNUSED_VARIABLE") val tick = refilterTick
             if (!Parental.hideAdult && !DeadLinks.hide && IgnoredGroups.isEmpty) return raw
+            if (raw === filteredFor && ver != filteredVer && baseVer() == filteredBase) {
+                // Only "ignore" changed: keep the previous list for a moment, filter in the background
+                refilterLater(raw, ver)
+                return filtered
+            }
             if (raw !== filteredFor || ver != filteredVer) {
-                filtered = shownOf(raw); filteredFor = raw; filteredVer = ver
+                filtered = shownOf(raw); filteredFor = raw; filteredVer = ver; filteredBase = baseVer()
             }
             return filtered
         }
@@ -106,6 +145,14 @@ object PlaylistStore {
 
     var loading by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
+    /** #112: a saved playlist list exists but could not be decrypted, so the app starts empty. Shown on the empty home screen. */
+    var unreadable by mutableStateOf(false)
+    /**
+     * Updating failed while the old list is still shown (the old list stays). Before, this stayed silent, so it looked as if
+     * the playlist simply did not update. Shown in the playlist settings; cleared by the next successful load.
+     */
+    var refreshError by mutableStateOf<String?>(null)
+        private set
     /** true while downloading or parsing (not during fast reading of the cache) – then show the loading screen. */
     var heavy by mutableStateOf(false)
         private set
@@ -153,9 +200,80 @@ object PlaylistStore {
     val shownUrl: String? get() = primaryUrl
     private var primaryEpg: List<String> = emptyList()
     private var primaryOrder: Map<String, Int> = emptyMap()
+    /** The active sublist name for the current playlist (null = full playlist). */
+    @Volatile private var sublistName: String? = null
+    /** The active sublist filter (null = none). Set before show() is called. */
+    @Volatile private var sublistFilter: SublistFilter? = null
+    /** Number of items that passed the sublist filter on the last load (for UI preview). */
+    var sublistMatchCount by mutableStateOf(0)
+        private set
+    /** Total number of items parsed before sublist filtering (for UI preview). */
+    var sublistTotalCount by mutableStateOf(0)
+        private set
+
+    /** Unique group/category values found in the loaded playlist at [url], sorted alphabetically. Used by the regular UI to show what is currently loaded. */
+    suspend fun playlistGroups(url: String): List<String> = withContext(Dispatchers.IO) {
+        if (primaryUrl != url) emptyList() else primaryItems.map { it.group }.distinct().sorted()
+    }
+
+    /** Unique language values found in the loaded playlist at [url], sorted alphabetically. Used by the regular UI to show what is currently loaded. */
+    suspend fun playlistLanguages(url: String): List<String> = withContext(Dispatchers.IO) {
+        if (primaryUrl != url) emptyList() else primaryItems.map { it.lang }.distinct().sorted()
+    }
+
+    /** All group/category values in the cached playlist at [url], before any sublist filtering, per kind (LIVE/MOVIE/SERIES). */
+    suspend fun cachedPlaylistGroupsByKind(c: Context, url: String): Map<Kind, List<String>> = withContext(Dispatchers.IO) {
+        readCache(c, url, emptySet())?.let {
+            it.items.groupBy { it.kind }.mapValues { it.value.map { it.group }.distinct().sorted() }
+        } ?: emptyMap()
+    }
+
+    /** All language values in the cached playlist at [url], before any sublist filtering, per kind (LIVE/MOVIE/SERIES). */
+    suspend fun cachedPlaylistLanguagesByKind(c: Context, url: String): Map<Kind, List<String>> = withContext(Dispatchers.IO) {
+        readCache(c, url, emptySet())?.let {
+            it.items.groupBy { it.kind }.mapValues { it.value.map { it.lang }.distinct().sorted() }
+        } ?: emptyMap()
+    }
+
+    /** Export all categories and languages from the cached playlist at [url] as CSV text.
+     * Returns null if no cache exists for this playlist. No network access. */
+    suspend fun exportPlaylistInfo(c: Context, url: String): String? = withContext(Dispatchers.IO) {
+        val groups = cachedPlaylistGroupsByKind(c, url)
+        val langs = cachedPlaylistLanguagesByKind(c, url)
+        if (groups.isEmpty() && langs.isEmpty()) null else {
+            val sb = StringBuilder()
+            sb.append("Kind,Type,Value\n")
+            for (kind in Kind.entries) {
+                for (g in groups.getOrDefault(kind, emptyList()).sorted()) {
+                    sb.append("${kind.displayName},Category,$g\n")
+                }
+            }
+            for (kind in Kind.entries) {
+                for (l in langs.getOrDefault(kind, emptyList()).sorted()) {
+                    sb.append("${kind.displayName},Language,$l\n")
+                }
+            }
+            sb.toString()
+        }
+    }
     private var epgSig = 0L
-    private var inited = false
+    @Volatile private var inited = false
+    private var initing = false   // T-047: set while [ensure] runs, so a call from inside it returns (as before)
+    private val initLock = Any()
     private val loadLock = Mutex()
+
+    /**
+     * The parsed list of a playlist as last shown, kept softly (the system may drop it under memory pressure), so switching
+     * back to it needs no disk read and no parsing. Valid only while [gen] of the playlist is unchanged (any write of its
+     * stored cache bumps it) and the language/content selection is the same.
+     */
+    private class Snap(
+        val items: List<Item>, val epg: List<String>, val order: Map<String, Int>,
+        val counts: Map<String, Int>, val bytes: Map<String, Long>, val hidden: Set<String>, val gen: Int
+    )
+    private val stash = java.util.concurrent.ConcurrentHashMap<String, java.lang.ref.SoftReference<Snap>>()
+    private val gens = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private fun bumpGen(url: String) { gens.merge(url, 1, Int::plus); stash.remove(url) }
     @Volatile private var job: Job? = null
     /** Last parse was too big: show the language selection on the next load with a UI. */
     @Volatile private var askNext = false
@@ -165,7 +283,7 @@ object PlaylistStore {
 
     private val XTREAM = Regex("""^(https?://[^/]+)/get\.php\?.*?username=([^&]+).*?password=([^&]+)""")
     // Common player identifier: some providers throttle unknown identifiers heavily (browser/VLC then load much faster)
-    private const val UA = "VLC/3.0.21 LibVLC/3.0.21"
+    private const val UA = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     /** A fully downloaded but not yet parsed list is reused for this long. */
     private const val RAW_MAX_AGE = 12 * 3_600_000L
     /** Free space that should remain at least after the download. */
@@ -173,6 +291,7 @@ object PlaylistStore {
 
     const val MSG_CANCEL = "Laden abgebrochen. Deine Angaben bleiben gespeichert."
     const val MSG_TOO_BIG = "Die gewählten Inhalte sind zu groß für den Speicher dieses Geräts. Bitte weniger Sprachen wählen."
+    const val MSG_INCOMPLETE = "Die Playlist kam nur unvollständig an. Bitte später erneut versuchen."
 
     /** Question for very large playlists: which languages should be loaded? */
     class LangAsk(val counts: Map<String, Int>, val bytes: Map<String, Long>, val preselect: Set<String>, val budget: Long) {
@@ -219,12 +338,23 @@ object PlaylistStore {
 
     private fun ensure(c: Context) {
         if (inited) return
-        inited = true
+        // T-047: also called by the read-ahead thread; other threads wait until the lists are filled
+        synchronized(initLock) {
+            if (inited || initing) return
+            initing = true
+            try { ensureOnce(c) } finally { inited = true }
+        }
+    }
+
+    private fun ensureOnce(c: Context) {
         cleanupStale(c)
         val p = prefs(c)
         // Prefers the encrypted version; the old plain-text version is adopted and replaced on first start.
         val enc = p.getString("lists_enc", null)
-        val json = (if (enc != null) Secrets.decrypt(enc) else null) ?: p.getString("lists", "[]")
+        val dec = if (enc != null) Secrets.decrypt(enc) else null
+        // #112: the saved list exists but cannot be decrypted (e.g. the key was lost). It is kept, see persist()
+        if (enc != null && dec == null) { unreadable = true; Diag.report("The saved playlist list could not be decrypted") }
+        val json = dec ?: p.getString("lists", "[]")
         try {
             val a = JSONArray(json)
             for (i in 0 until a.length()) {
@@ -257,6 +387,9 @@ object PlaylistStore {
         for (l in lists) a.put(JSONObject().put("name", l.name).put("url", l.url))
         val e = prefs(c).edit().putInt("active", active).putString("multi", MultiLogic.encodeKeys(multi)).remove("url")
         val token = Secrets.encrypt(a.toString())
+        // #112: never replace an unreadable saved list without keeping it (the link and login may still be recoverable)
+        val prev = prefs(c).getString("lists_enc", null)
+        if (prev != null && Secrets.decrypt(prev) == null && !prefs(c).contains("lists_enc_unreadable")) e.putString("lists_enc_unreadable", prev)
         if (token != null) e.putString("lists_enc", token).remove("lists")
         else e.putString("lists", a.toString()).remove("lists_enc")
         e.apply()
@@ -331,6 +464,47 @@ object PlaylistStore {
     }
 
     fun savedUrl(c: Context): String? { ensure(c); return lists.getOrNull(active)?.url }
+
+    /** Resolve the active sublist filter for [url] (null = load the full playlist). */
+    fun activeSublist(c: Context, url: String): SublistFilter? {
+        ensure(c)
+        val name = SublistStore.active(c, key(url))
+        if (name == null) return null
+        return SublistStore.allFor(c, key(url)).firstOrNull { it.name == name }?.filter
+    }
+
+    /** How many entries of [url] match the active sublist filter: (matching, total). Computes by parsing once without storing. */
+    suspend fun previewCount(c: Context, url: String): Pair<Int, Int> {
+        ensure(c)
+        val u = PlaylistLogic.normalizeUrl(url) ?: return Pair(0, 0)
+        val f = activeSublist(c, u)
+        if (f == null || !f.enabled) return Pair(0, 0)
+        return previewCount(c, u, f)
+    }
+
+    /** How many entries of [url] match [f]: (matching, total). Uses already-loaded items when possible, otherwise reads from cache (fast). */
+    suspend fun previewCount(c: Context, url: String, f: SublistFilter): Pair<Int, Int> {
+        ensure(c)
+        if (!f.enabled) return Pair(0, 0)
+        val u = PlaylistLogic.normalizeUrl(url) ?: return Pair(0, 0)
+        return withContext(Dispatchers.IO) {
+            try {
+                val items: List<Item> = if (primaryUrl == u) {
+                    primaryItems
+                } else {
+                    val cached = readCache(c, u, emptySet())
+                    if (cached != null) cached.items else {
+                        val (src, cs) = downloadWithRetry(c, u)
+                        val b = build(c, u, src, false, cs, ask = false, null)
+                        b.parsed.items
+                    }
+                }
+                val total = items.size
+                val matching = items.count { f.matches(it) }
+                Pair(matching, total)
+            } catch (e: Exception) { Pair(0, 0) }
+        }
+    }
 
     /** Xtream address (user and password URL-encoded) or null if a value is missing or invalid. */
     fun xtreamUrl(host: String, user: String, pass: String): String? = PlaylistLogic.xtreamUrl(host, user, pass)
@@ -417,6 +591,7 @@ object PlaylistStore {
         ensure(c)
         if (i !in lists.indices) return
         deleteFiles(c, lists[i].url)
+        PlaylistRefresh.clear(c, lists[i].url)
         prefs(c).edit().remove(backupKey(lists[i].url)).apply()
         if (adding == lists[i].url) adding = null
         extras.remove(lists[i].url)
@@ -434,7 +609,12 @@ object PlaylistStore {
         val out = LinkedHashMap<String, Int>()
         for (act in listOf("get_vod_categories", "get_series_categories", "get_live_categories")) {
             try {
-                val body = client.newCall(Request.Builder().url(base + act).build()).execute().use { r ->
+                val body = client.newCall(Request.Builder().url(base + act)
+                    .header("User-Agent", UA)
+                    .header("Accept", "*/*")
+                    .header("Accept-Language", "en-US,en;q=0.9,de;q=0.8")
+                    .header("Connection", "keep-alive")
+                    .build()).execute().use { r ->
                     if (r.isSuccessful) r.body?.string() else null
                 } ?: continue
                 val a = JSONArray(body)
@@ -450,8 +630,26 @@ object PlaylistStore {
 
     // ------------------------------------------------------------------ files per playlist
 
-    private fun key(url: String) = url.trim().hashCode()
+    internal fun key(url: String) = url.trim().hashCode()
     private fun cacheFile(c: Context, url: String) = File(c.filesDir, "pl_" + key(url) + ".bin")
+
+    /** #90: this playlist address sends the app's own user-agent (the user opted in when adding it). */
+    fun nativeUa(c: Context, url: String): Boolean = prefs(c).getBoolean(PlaylistUaLogic.prefKey(key(url)), false)
+    fun setNativeUa(c: Context, url: String, on: Boolean) { prefs(c).edit().putBoolean(PlaylistUaLogic.prefKey(key(url)), on).apply() }
+    private fun uaFor(c: Context, url: String): String = PlaylistUaLogic.pick(nativeUa(c, url), BuildConfig.VERSION_NAME)
+
+    /** #111: number of live channels, movies and series of a loaded playlist (stored at load time). */
+    fun saveTypeCounts(c: Context, url: String, items: List<Item>) {
+        val t = PlaylistCountLogic.TypeCounts(
+            live = items.count { it.kind == Kind.LIVE },
+            movies = items.count { it.kind == Kind.MOVIE },
+            series = items.count { it.kind == Kind.SERIES },
+        )
+        prefs(c).edit().putString("cnt_" + key(url), PlaylistCountLogic.encode(t)).apply()
+    }
+
+    fun typeCounts(c: Context, url: String): PlaylistCountLogic.TypeCounts? =
+        PlaylistCountLogic.decode(prefs(c).getString("cnt_" + key(url), null))
     private fun gzFile(c: Context, url: String) = File(c.filesDir, "pl_" + key(url) + ".m3u.gz")
     private fun rawFile(c: Context, url: String) = File(c.filesDir, "pl_" + key(url) + ".m3u")
     /** Stalker portal: categories of which only the newest titles were fetched while loading (see [StalkerMore]). */
@@ -461,6 +659,7 @@ object PlaylistStore {
     private fun tmp(f: File) = File(f.path + ".tmp")
 
     private fun deleteFiles(c: Context, url: String) {
+        bumpGen(url)
         if (url.startsWith("file://")) runCatching { File(java.net.URI(url)).takeIf { it.path.contains("/imports/") }?.delete() }
         val main = listOf(cacheFile(c, url), gzFile(c, url), rawFile(c, url), partFile(c, url), infoFile(c, url), Catchup.file(c, url), stalkerMoreFile(c, url))
         (main + main.map { tmp(it) }).forEach { runCatching { it.delete() } }
@@ -470,6 +669,7 @@ object PlaylistStore {
         c: Context, url: String, list: List<Item>, epg: List<String>, order: Map<String, Int>,
         counts: Map<String, Int>, bytes: Map<String, Long>, hidden: Set<String>
     ) {
+        bumpGen(url)
         try {
             val f = cacheFile(c, url)
             val t = tmp(f)
@@ -506,6 +706,40 @@ object PlaylistStore {
         } catch (e: OutOfMemoryError) {
             null
         }
+    }
+
+    /** T-047: stored list read ahead on a background thread at the start (result for one address, language selection and file state). */
+    private class Pre(val url: String, val hidden: Set<String>, val stamp: Long, val task: java.util.concurrent.FutureTask<PlaylistCacheIO.Cached?>)
+    @Volatile private var pre: Pre? = null
+
+    private fun stampOf(f: File): Long = f.length() * 31 + f.lastModified()
+
+    /**
+     * Starts reading the stored list of the active playlist while the first screen is built (call from a background thread).
+     * Same conditions as [fromLocal]; if anything differs there, the result is simply not used. Nothing is shown from here.
+     */
+    fun preread(c: Context) {
+        try {
+            val u = savedUrl(c)?.let { PlaylistLogic.normalizeUrl(it) } ?: return
+            if (pending(c)?.autoResume == true) return   // the add screen continues loading instead
+            val hidden = PlaylistMode.withMode(c, u, LangFilter.hidden)
+            val head = readHeader(c, u) ?: return
+            if (head.hidden != hidden || head.counts.isEmpty()) return
+            val f = cacheFile(c, u)
+            val task = java.util.concurrent.FutureTask<PlaylistCacheIO.Cached?> { readCache(c, u, hidden) }
+            pre = Pre(u, hidden, stampOf(f), task)
+            task.run()
+        } catch (e: Throwable) {
+            pre = null
+        }
+    }
+
+    /** The read-ahead result if it still fits (waits if it is still running), otherwise null. Used once. */
+    private fun takePreread(c: Context, u: String, hidden: Set<String>): PlaylistCacheIO.Cached? {
+        val p = pre ?: return null
+        pre = null
+        if (p.url != u || p.hidden != hidden || p.stamp != stampOf(cacheFile(c, u))) return null
+        return try { p.task.get() } catch (e: Exception) { null }
     }
 
     private fun sig(l: List<Item>): Long {
@@ -545,8 +779,15 @@ object PlaylistStore {
                 if (attempt < 2) { phase = "Verbindung unterbrochen – neuer Versuch …"; delay(3000) }
             }
         }
+        if (last is IncompleteDownload) throw PlaylistError(MSG_INCOMPLETE)
         throw last ?: IOException("Download")
     }
+
+    /** The list arrived only in part. Never parsed, never stored as cache; retried like a lost connection. */
+    private class IncompleteDownload : IOException("Download unvollständig")
+
+    /** true if the size of the last list download was unknown (then [download] checks it for completeness). */
+    @Volatile private var lastUnsized = false
 
     private fun charsetOf(name: String?): Charset = try { Charset.forName(name ?: "UTF-8") } catch (e: Exception) { Charsets.UTF_8 }
 
@@ -563,23 +804,98 @@ object PlaylistStore {
             return f to Charsets.UTF_8
         }
         StalkerLogic.parse(u)?.let { return downloadStalker(c, u, it) }
-        val acct = XtreamLogic.fromUrl(u) ?: return downloadList(c, u)
+        val acct = XtreamLogic.fromUrl(u)
+        if (acct == null) {
+            // Shown on the Diagnostics page: a plain M3U address has movies and series only if the list itself has them
+            Diag.note(hostOf(u) + ": M3U address (not an Xtream login), movies and series come only from the list")
+            return downloadList(c, u)
+        }
         // If get.php has already failed once for this login, use the API right away
-        if (useApi(c, u)) return downloadApi(c, u, acct)
+        if (useApi(c, u)) { Diag.note(hostOf(u) + ": Xtream, loaded through the provider's API"); return apiOrList(c, u, acct) }
         val got = try {
             downloadList(c, u)
         } catch (e: PlaylistError) {
             return apiInstead(c, u, acct, e)
+        } catch (e: IncompleteDownload) {
+            // get.php was cut off: the API delivers JSON, where a cut always fails instead of looking like a short list
+            return apiInstead(c, u, acct, PlaylistError(MSG_INCOMPLETE))
         }
         val head = runCatching { got.first.inputStream().use { s -> val b = ByteArray(512); val k = s.read(b); if (k > 0) String(b, 0, k, got.second) else "" } }.getOrDefault("")
-        if (XtreamLogic.looksLikeM3u(head)) return got
+        if (XtreamLogic.looksLikeM3u(head)) {
+            if (!lastUnsized || !missesCategories(acct, got.first, got.second)) return vodViaApi(c, u, acct, got)
+            // Most of the provider's live categories are missing: the list arrived only in part
+            got.first.delete(); infoFile(c, u).delete()
+            return apiInstead(c, u, acct, PlaylistError(MSG_INCOMPLETE))
+        }
         // 200, but no list (error page, empty response): try the API
         got.first.delete(); infoFile(c, u).delete()
         return apiInstead(c, u, acct, PlaylistError("Der Server hat keine gültige Playlist geliefert."))
     }
 
+    /**
+     * Some providers deliver only live channels through get.php (for example "type=m3u" or a live-only output setting),
+     * while their API has movies and series. The list then loaded without any movie or series. If the list has none and
+     * the provider lists movie or series categories, the whole list is loaded through the API instead (remembered for this
+     * login, like [apiInstead]). If the API fails, the get.php list is kept, so the live channels never get lost.
+     */
+    private fun vodViaApi(c: Context, u: String, acct: XtreamLogic.Acct, got: Pair<File, Charset>): Pair<File, Charset> {
+        val host = hostOf(u)
+        val groups = runCatching { got.first.bufferedReader(got.second).useLines { LoadLogic.vodGroups(it) } }.getOrNull() ?: return got
+        if (cancelled()) throw CancellationException("abgebrochen")
+        val api = XtreamApi(client, uaFor(c, u))
+        if (groups.movies.isNotEmpty() || groups.series.isNotEmpty()) {
+            // T-067: some providers put only part of their movies or series into get.php. Most of the provider's movie or
+            // series categories missing from the list: load the whole list through the API (two small requests to check).
+            val vodApi = runCatching { api.vodCategoryNames(acct) }.getOrDefault(emptyList())
+            val serApi = runCatching { api.seriesCategoryNames(acct) }.getOrDefault(emptyList())
+            val partial = LoadLogic.missingCategories(vodApi, groups.movies) || LoadLogic.missingCategories(serApi, groups.series)
+            PlaylistDiag.log("vod", "get.php movie categories ${groups.movies.size}/${vodApi.size}, series ${groups.series.size}/${serApi.size}, partial=$partial")
+            if (!partial) { Diag.note("$host: Xtream list (get.php) with movies or series"); return got }
+            Diag.note("$host: Xtream list (get.php) misses most movie or series categories (movies ${groups.movies.size} of ${vodApi.size}, series ${groups.series.size} of ${serApi.size}): loading through the API")
+        } else {
+            if (!runCatching { api.hasVodCategories(acct) }.getOrDefault(false)) {
+                Diag.note("$host: Xtream list (get.php) without movies or series; the provider's API lists no movie or series categories either")
+                return got
+            }
+            Diag.note("$host: Xtream list (get.php) without movies or series, the provider's API has them: loading through the API")
+            PlaylistDiag.log("vod", "get.php has no movies or series, the provider lists them: API")
+        }
+        // downloadApi writes the same raw file: keep the get.php list aside until the API list is complete
+        val keep = File(got.first.path + ".liveonly")
+        keep.delete()
+        if (!got.first.renameTo(keep)) return got
+        infoFile(c, u).delete()
+        return try {
+            downloadApi(c, u, acct).also {
+                prefs(c).edit().putBoolean(apiKey(u), true).apply()
+                keep.delete()
+                Diag.note("$host: loaded through the API")
+            }
+        } catch (e: CancellationException) {
+            keep.delete()
+            throw e
+        } catch (e: Exception) {
+            PlaylistDiag.log("vod", "API failed, keeping the get.php list: " + e.javaClass.simpleName)
+            Diag.note("$host: API failed (" + e.javaClass.simpleName + "), the live channels of get.php are kept")
+            got.first.delete()
+            if (keep.renameTo(got.first)) got else throw e
+        }
+    }
+
     private fun apiKey(u: String) = "xt_api_" + key(u)
     private fun useApi(c: Context, u: String) = prefs(c).getBoolean(apiKey(u), false)
+
+    /**
+     * The API is the known-good path for this login. If it delivers an incomplete list (e.g. no films although the
+     * provider has film categories), the marker is dropped and the complete M3U (get.php) is tried once.
+     */
+    private fun apiOrList(c: Context, u: String, acct: XtreamLogic.Acct): Pair<File, Charset> = try {
+        downloadApi(c, u, acct)
+    } catch (e: PlaylistError) {
+        if (!e.incomplete) throw e
+        prefs(c).edit().remove(apiKey(u)).apply()
+        downloadList(c, u)
+    }
 
     /** get.php failed: load via player_api.php and remember that for this login. If that fails too, the clearer error counts. */
     private fun apiInstead(c: Context, u: String, acct: XtreamLogic.Acct, first: PlaylistError): Pair<File, Charset> {
@@ -600,7 +916,11 @@ object PlaylistStore {
     }
 
     /** API access for the episodes of a series that are only loaded when it is opened ([LazySeries]). */
-    internal fun xtreamApi(): XtreamApi = XtreamApi(client, UA)
+    /** #90: the user-agent of the active playlist (the series belong to it), VLC if unknown. */
+    internal fun xtreamApi(c: Context? = null): XtreamApi {
+        val u = lists.getOrNull(active)?.url
+        return XtreamApi(client, if (c != null && u != null) uaFor(c, u) else UA)
+    }
 
     /** Build the list via the provider's API (see [XtreamApi]) and store it like a finished download. */
     private fun downloadApi(c: Context, u: String, acct: XtreamLogic.Acct): Pair<File, Charset> {
@@ -613,7 +933,7 @@ object PlaylistStore {
         }
         raw.delete(); part.delete()
         bytesRead = 0L; totalBytes = -1L; downloadDone = false
-        val api = XtreamApi(client, UA)
+        val api = XtreamApi(client, uaFor(c, u))
         api.onPhase = { phase = it }
         api.check = { if (cancelled()) throw CancellationException("abgebrochen") }
         // Shown bytes = written list + movies/series still in temporary files (fetched in parallel). Never goes backwards:
@@ -626,6 +946,7 @@ object PlaylistStore {
         val counter = CountingOut(FileOutputStream(part)) { k -> synchronized(lock) { listN = k; show() } }
         try {
             val n = OutputStreamWriter(BufferedOutputStream(counter, 1 shl 16), Charsets.UTF_8).use { w -> api.write(acct, w) }
+            PlaylistDiag.log("download(api)", "entries=$n bytes=${part.length()}")
             if (n == 0) throw PlaylistError("Keine Sender in der Playlist gefunden.")
         } catch (e: Throwable) {
             part.delete()
@@ -669,15 +990,21 @@ object PlaylistStore {
         val part = partFile(c, u)
         val pi = LoadLogic.PartInfo.decode(runCatching { info.readText() }.getOrNull())?.takeIf { it.urlHash == key(u) }
         if (pi != null && raw.exists() && raw.length() > 0 && System.currentTimeMillis() - raw.lastModified() < RAW_MAX_AGE) {
+            lastUnsized = false   // was checked when it was downloaded
             return raw to charsetOf(pi.charset)
         }
         raw.delete()
+        lastUnsized = false
         var offset = if (pi != null && part.exists()) part.length() else 0L
         // After a power loss the last written bytes may be missing or corrupt: go back a bit
         if (offset > 0) { offset = maxOf(0L, offset - 65_536); RandomAccessFile(part, "rw").use { it.setLength(offset) } }
         val extra = if (pi != null) LoadLogic.resumeHeaders(offset, pi.etag, pi.lastModified) else emptyMap()
         if (extra.isEmpty()) offset = 0L
-        val rb = Request.Builder().url(u).header("User-Agent", UA)
+        val rb = Request.Builder().url(u)
+            .header("User-Agent", uaFor(c, u))
+            .header("Accept", "*/*")
+            .header("Accept-Language", "en-US,en;q=0.9,de;q=0.8")
+            .header("Connection", "keep-alive")
         extra.forEach { (k, v) -> rb.header(k, v) }
         phase = if (offset > 0) "Download wird fortgesetzt …" else "Verbindung zum Server wird aufgebaut …"
         bytesRead = offset; totalBytes = -1L; downloadDone = false
@@ -725,15 +1052,53 @@ object PlaylistStore {
                     out.flush()
                     bytesRead = n
                 }
-                if (total > 0 && part.length() < total) throw IOException("Download unvollständig")
+                if (total > 0 && part.length() < total) throw IncompleteDownload()
+                lastUnsized = total <= 0
             }
         } finally {
             call = null
         }
         if (part.length() == 0L) throw PlaylistError("Der Server hat keine Daten geliefert.")
+        // Without a size the end of a cut-off download looks normal: check the end of the file
+        val cut = lastUnsized && LoadLogic.tailLooksCut(tailOf(part))
+        PlaylistDiag.log("download", "bytes=${part.length()} sized=${!lastUnsized} tailCut=$cut")
+        if (cut) {
+            part.delete(); info.delete()   // start from the beginning on the next attempt
+            throw IncompleteDownload()
+        }
         raw.delete()
         if (!part.renameTo(raw)) throw IOException("Datei konnte nicht umbenannt werden")
         return raw to charsetOf(LoadLogic.PartInfo.decode(runCatching { info.readText() }.getOrNull())?.charset)
+    }
+
+    /** The last bytes of a file as text (only the line structure matters, so the charset does not). */
+    private fun tailOf(f: File, max: Int = 4096): String = RandomAccessFile(f, "r").use { r ->
+        val n = minOf(r.length(), max.toLong()).toInt()
+        val b = ByteArray(n)
+        r.seek(r.length() - n)
+        r.readFully(b)
+        String(b, Charsets.ISO_8859_1)
+    }
+
+    /**
+     * Xtream list from get.php without a known size: compare its categories with the provider's live categories.
+     * true = most of them are missing (list cut off). If the provider does not answer, the list is accepted.
+     */
+    private fun missesCategories(acct: XtreamLogic.Acct, f: File, cs: Charset): Boolean {
+        val api = runCatching { XtreamApi(client, UA).liveCategoryNames(acct) }.getOrNull().orEmpty()
+        if (api.size < 5) return false
+        phase = "Playlist wird geprüft …"
+        val found = HashSet<String>()
+        var k = 0
+        f.bufferedReader(cs).useLines { lines ->
+            for (l in lines) {
+                if (l.startsWith("#EXTINF")) LoadLogic.groupTitle(l)?.let { found.add(LoadLogic.normGroup(it)) }
+                if (++k % 20_000 == 0 && cancelled()) throw CancellationException("abgebrochen")
+            }
+        }
+        val missing = LoadLogic.missingCategories(api, found)
+        PlaylistDiag.log("categories", "provider=${api.size} inList=${found.size} cut=$missing")
+        return missing
     }
 
     // ------------------------------------------------------------------ Reading
@@ -795,7 +1160,11 @@ object PlaylistStore {
                 phase = "Playlist wird geprüft …"
                 val scan = readFile(src, gz, cs, null) { r -> M3uParser.scanStream(r, guard()) }
                 if (wantAsk || LoadLogic.estimate(scan.bytes, hidden) > budget) {
-                    if (!ask) throw PlaylistError(MSG_TOO_BIG)
+                    if (!ask) {
+                        // #73 diagnostics: memory limit and language filter at the moment the list is refused (numbers only)
+                        Diag.report("Memory budget ${budget / 1_000_000} MB, heap ${Runtime.getRuntime().maxMemory() / 1_000_000} MB, ${hidden.size} languages hidden")
+                        throw PlaylistError(MSG_TOO_BIG)
+                    }
                     val now = scan.counts.keys - hidden
                     val pre = if (LangFilter.hidden.isNotEmpty() && now.isNotEmpty()) now else LoadLogic.systemPreselect(scan.counts, systemLang())
                     val shown = askLanguages(scan.counts, scan.bytes, budget, pre) ?: throw PlaylistError(MSG_CANCEL)
@@ -838,11 +1207,39 @@ object PlaylistStore {
         c: Context, u: String, items: List<Item>, epg: List<String>, order: Map<String, Int>,
         counts: Map<String, Int>, bytes: Map<String, Long>, hidden: Set<String>
     ) {
+        stash[u] = java.lang.ref.SoftReference(Snap(items, epg, order, counts, bytes, hidden, gens[u] ?: 0))
         langCounts = counts
         langBytes = bytes
         shownHidden = hidden
-        primaryItems = items; primaryUrl = u; primaryEpg = epg; primaryOrder = order
+        // Apply sublist filter before storing: only matching items enter primaryItems / rawChannels.
+        val filteredBySublist = if (sublistFilter?.enabled == true) {
+            val f = sublistFilter!!
+            sublistTotalCount = items.size
+            val kept = items.filter { f.matches(it) }
+            sublistMatchCount = kept.size
+            kept
+        } else {
+            sublistTotalCount = items.size
+            sublistMatchCount = items.size
+            items
+        }
+        primaryItems = filteredBySublist; primaryUrl = u; primaryEpg = epg; primaryOrder = order
         rebuild(c)
+    }
+
+    /** Set the active sublist for the playlist at [url] before it is loaded. [null] = full playlist. */
+    fun setSublistForLoad(c: Context, url: String, filter: SublistFilter?, name: String?) {
+        ensure(c)
+        sublistFilter = filter
+        sublistName = name
+        val h = key(url)
+        SublistStore.setActive(c, h, name)
+    }
+
+    /** Clear any pending sublist so the next load uses the full playlist. */
+    fun clearSublistForLoad() {
+        sublistFilter = null
+        sublistName = null
     }
 
     /** Further shown playlists (without the active one), in list order. */
@@ -850,6 +1247,9 @@ object PlaylistStore {
         ensure(c)
         return lists.filterIndexed { i, pl -> i != active && key(pl.url) in multi }.map { it.url }
     }
+
+    /** Addresses of the shown sources in source order (0 = active, then the others in list order), as [sourceNames]. */
+    fun shownUrls(c: Context): List<String> = listOfNotNull(shownUrl) + extraUrls(c)
 
     fun isShown(i: Int): Boolean = i == active || (i in lists.indices && key(lists[i].url) in multi)
 
@@ -862,18 +1262,192 @@ object PlaylistStore {
     }
 
     /**
-     * Switch playlist (Live TV, without settings): makes [i] the active playlist and immediately shows the cache
-     * of the new playlist; then it is refreshed from the server. The old display is discarded, otherwise it would stay visible.
+     * Switch playlist (Live TV, header, settings): makes [i] the active playlist and shows the copy stored on the device;
+     * the server is only asked when there is no stored copy yet. The old list is dropped first: keeping both lists in memory
+     * at once ran weak devices (Fire TV Stick) out of memory.
      */
-    suspend fun switchTo(c: Context, i: Int) {
+    /**
+     * Switching back to a playlist shown before: its parsed list is still in memory, so it replaces the current one at once
+     * (no empty screen, no loading overlay, no disk read). false = not possible, the normal switch runs.
+     */
+    private suspend fun switchFromMemory(c: Context, i: Int): Boolean {
+        val u = PlaylistLogic.normalizeUrl(lists[i].url) ?: return false
+        val snap = stash[u]?.get() ?: return false
+        if (snap.gen != (gens[u] ?: 0)) return false
+        if (snap.hidden != PlaylistMode.withMode(c, u, LangFilter.hidden)) return false
+        if (SublistStore.active(c, key(u)) != null) return false   // a saved sublist filter is applied by the normal load
+        if (!loadLock.tryLock()) return false
+        try {
+            clearSublistForLoad()
+            activate(c, i)
+            error = null; refreshError = null
+            withContext(Dispatchers.IO) {
+                show(c, u, snap.items, snap.epg, snap.order, snap.counts, snap.bytes, snap.hidden)
+                runCatching { loadExtras(c, network = false) }.onFailure { if (it is CancellationException) throw it }
+            }
+            PlaylistDiag.log("switch", "from memory")
+            return true
+        } finally {
+            loadLock.unlock()
+        }
+    }
+
+    /**
+     * T-068: switching to a playlist with a stored copy keeps the current list on screen while the copy is read, then
+     * replaces it in one step. Before, the list was emptied first, so Live TV, Movies and Series turned into the loading
+     * screen for the length of the read. Only when memory has room for both lists for a moment (weak Fire TV sticks ran
+     * out of memory with both); the read stops when memory gets tight and the old switch (empty first) runs instead.
+     * false = not possible here, the normal switch runs.
+     */
+    private suspend fun switchKeepingList(c: Context, i: Int): Boolean {
+        if (rawChannels.isEmpty()) return false
+        val u = PlaylistLogic.normalizeUrl(lists[i].url) ?: return false
+        if (SublistStore.active(c, key(u)) != null) return false   // a saved sublist filter is applied by the normal load
+        val hidden = PlaylistMode.withMode(c, u, LangFilter.hidden)
+        val f = cacheFile(c, u)
+        val r = Runtime.getRuntime()
+        val free = r.maxMemory() - (r.totalMemory() - r.freeMemory())
+        if (!SwitchLogic.roomForBoth(f.length(), free)) return false
+        if (!loadLock.tryLock()) return false
+        val before = active
+        var shown = false
+        try {
+            val head = withContext(Dispatchers.IO) { readHeader(c, u) } ?: return false
+            if (head.hidden != hidden || head.counts.isEmpty()) return false
+            job = currentCoroutineContext()[Job]
+            loading = true
+            activate(c, i)   // the header and the playlist menu show the new choice at once
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            val cached = withContext(Dispatchers.IO) { readCache(c, u, hidden) }
+            if (cached == null || cached.counts.isEmpty()) return false
+            clearSublistForLoad()
+            error = null; refreshError = null
+            withContext(Dispatchers.IO) {
+                show(c, u, cached.items, cached.epg, cached.order, cached.counts, cached.bytes, hidden)
+                runCatching { loadExtras(c, network = false) }.onFailure { if (it is CancellationException) throw it }
+            }
+            shown = true
+            PlaylistDiag.log("switch", "kept the old list while reading the stored copy")
+            Diag.note("Playlist switch: stored list ${cached.items.size} items read in ${android.os.SystemClock.elapsedRealtime() - t0} ms, the screen stayed")
+            return true
+        } finally {
+            // Not switched (read failed, cancelled): the old list is still on screen, so its playlist stays the active one.
+            // On a plain failure the normal switch runs next and activates the new one again.
+            if (!shown && active != before) activate(c, before)
+            job = null
+            loading = false
+            loadLock.unlock()
+        }
+    }
+
+    suspend fun switchTo(c: Context, i: Int, fresh: Boolean = false) {
         ensure(c)
         if (i !in lists.indices) return
         if (loadLock.isLocked) return   // a load is already running: do not interfere
+        if (!fresh && switchFromMemory(c, i)) return
+        if (!fresh && switchKeepingList(c, i)) return
         activate(c, i)
+        // Mark the load before the list is emptied: otherwise one frame shows "No channels yet" instead of the loading screen.
+        // No suspension point between here and load(), so its lock is still free.
+        loading = true
         primaryItems = emptyList(); primaryUrl = null
         merged = MultiLogic.Merged(emptyList(), emptySet(), emptyMap()); sourceNames = emptyList()
         setItems(emptyList())
-        load(c, lists[i].url, false)
+        // Read the playlist stored on the device; download only when there is none yet (a switch back must not reload
+        // the whole list from the server). Refreshing follows the refresh plan at app start or "Refresh" in the settings.
+        load(c, lists[i].url, false, skipNetworkWhenCached = !fresh)
+    }
+
+    /**
+     * Runs [switchTo] in a scope that outlives the screen that started it. The switch empties the list, the home screen then
+     * replaces Live TV / the movie or series page by the loading screen, and a scope remembered there was cancelled with it:
+     * the load stopped half way and "No channels yet" stayed until a restart (issues 1 and 16).
+     */
+    fun switchAsync(c: Context, i: Int) {
+        val app = c.applicationContext
+        switchScope.launch { switchTo(app, i) }
+    }
+
+    /**
+     * "Reload" on a playlist of the list: makes it the main list and downloads it again from the provider
+     * (the stored copy is not used). Same scope as [switchAsync], so leaving the screen does not stop it.
+     */
+    fun reloadAsync(c: Context, i: Int) {
+        val app = c.applicationContext
+        switchScope.launch { switchTo(app, i, fresh = true) }
+    }
+
+    /** Address of the playlist that [refreshOtherNow] is reloading right now (null = none). */
+    var reloadingOther by mutableStateOf<String?>(null)
+        private set
+
+    /** "Reload" on a playlist that is not the main list (T-048): see [refreshOtherNow]. */
+    fun reloadOtherAsync(c: Context, i: Int) {
+        val app = c.applicationContext
+        switchScope.launch { refreshOtherNow(app, i) }
+    }
+
+    /**
+     * Downloads a playlist that is not the main list again into its stored copy, without making it the main list. If it is
+     * shown next to the main list, that part is rebuilt from the new copy. A list with its own refresh plan notes the time.
+     * false = nothing done (a load runs, wrong list) or the download failed.
+     */
+    suspend fun refreshOtherNow(c: Context, i: Int): Boolean {
+        ensure(c)
+        if (i !in lists.indices || i == active || reloadingOther != null || loadLock.isLocked) return false
+        val u = lists[i].url
+        reloadingOther = u
+        try {
+            val ok = refreshCacheOnly(c, u)
+            if (ok) {
+                if (PlaylistRefreshLogic.hasOwnPlan(PlaylistRefresh.get(c, u))) PlaylistRefresh.markFor(c, u)
+                if (isShown(i)) { extras.remove(u); applyMulti(c) }
+            }
+            return ok
+        } finally {
+            reloadingOther = null
+        }
+    }
+
+    /**
+     * Refreshes the lists that are not the main list and whose own plan is due (T-048b); one after the other, not while
+     * something is playing. Called by the background job and some seconds after the start.
+     */
+    suspend fun refreshOthersDue(c: Context) {
+        ensure(c)
+        // The main list may still be loading (it holds the load lock): wait for it, at most 3 minutes, instead of skipping this round
+        var waited = 0
+        while (loadLock.isLocked && waited < 36) { kotlinx.coroutines.delay(5_000); waited++ }
+        val now = System.currentTimeMillis()
+        val due = lists.indices.filter { i ->
+            i != active && PlaylistRefreshLogic.otherDue(PlaylistRefresh.get(c, lists[i].url), PlaylistRefresh.lastFor(c, lists[i].url), now, General.zone())
+        }
+        for (i in due) {
+            if (AppNav.playing) return
+            refreshOtherNow(c, i)
+        }
+    }
+
+    /** Addresses of all playlists (for the background job). */
+    fun allUrls(c: Context): List<String> { ensure(c); return lists.map { it.url } }
+
+    private val switchScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /** Add a playlist sent from the phone settings (issue 18): loaded and adopted like "Add playlist" on the TV. */
+    fun addAsync(c: Context, url: String) {
+        val app = c.applicationContext
+        switchScope.launch { if (!loadLock.isLocked) load(app, url, true) }
+    }
+
+    /** Delete a playlist from the phone settings, like "Delete" in Settings > Playlists: the next one is loaded if it was the main list. */
+    fun removeAsync(c: Context, i: Int) {
+        val app = c.applicationContext
+        switchScope.launch {
+            if (i !in lists.indices || loadLock.isLocked) return@launch
+            val wasActive = i == active
+            remove(app, i)
+            if (wasActive && lists.isNotEmpty()) switchTo(app, active)
+        }
     }
 
     /** Show a playlist additionally (or no longer). Call [applyMulti] afterwards. */
@@ -883,6 +1457,43 @@ object PlaylistStore {
         val k = key(lists[i].url)
         multi = if (on) multi + k else multi - k
         persist(c)
+    }
+
+    /**
+     * T-051: show the playlists [indices] in addition to the main list and load them (stored copy first, otherwise the
+     * server). Runs in [switchScope], so closing the menu does not stop it. A load that is running blocks [applyMulti]:
+     * then it is tried again for up to 30 s (a load that ends later picks up the new selection on the next start anyway).
+     * Memory: [loadExtras] stops with a notice ([extraError]) before the device runs out of memory.
+     */
+    fun showAsync(c: Context, indices: Collection<Int>) {
+        ensure(c)
+        val add = indices.filter { it in lists.indices && it != active && !isShown(it) }
+        if (add.isEmpty()) return
+        for (i in add) setShown(c, i, true)
+        val app = c.applicationContext
+        switchScope.launch {
+            repeat(30) {
+                if (applyMulti(app)) return@launch
+                delay(1000)
+            }
+        }
+    }
+
+    /**
+     * Content mode of the main playlist was changed: parse the stored list again with the new mode (no download).
+     * A running load (start-up or refresh) holds the load lock; then this waits and tries again for up to 30 s instead of
+     * dropping the change, so "Movies & series" switched back on brings the titles back at once. Rebuilding alone
+     * ([applyMode]) cannot bring back titles left out while parsing. Runs in [switchScope], so closing the edit window or
+     * leaving the settings page does not stop it. (Taken from branch claude/epic-albattani-ses0se, 22 Nov 2026.)
+     */
+    fun modeChanged(c: Context) {
+        val app = c.applicationContext
+        switchScope.launch {
+            repeat(60) {
+                if (reapplyLanguages(app)) return@launch
+                delay(500)
+            }
+        }
     }
 
     /** Content mode of a playlist was changed: rebuild the shown list (no new download). */
@@ -1060,9 +1671,14 @@ object PlaylistStore {
             // Old version (whole list without language counts) with a very large file and no language selection: do not load everything into memory
             val legacyTooBig = head.hidden == null && (hidden - LangTagLogic.PSEUDO).isEmpty() && cacheFile(c, u).length() > budget()
             if (!legacyTooBig && (head.hidden == null || head.hidden == hidden)) {
-                val cached = readCache(c, u, hidden)
+                val t0 = android.os.SystemClock.elapsedRealtime()
+                val cached = takePreread(c, u, hidden) ?: readCache(c, u, hidden)
+                val t1 = android.os.SystemClock.elapsedRealtime()
                 if (cached != null && cached.counts.isNotEmpty()) {
+                    PlaylistDiag.log("cache", PlaylistDiag.summary(cached.items) + " hidden=${hidden.sorted()}")
                     show(c, u, cached.items, cached.epg, cached.order, cached.counts, cached.bytes, hidden)
+                    // Start-up timing for Settings > Diagnostics: reading the stored list, then building it for the screens
+                    Diag.note("Start: stored list ${cached.items.size} items read in ${t1 - t0} ms, shown in ${android.os.SystemClock.elapsedRealtime() - t1} ms, translations ${Lang.loadMs} ms registered, ${Lang.prewarmMs} ms parsed in the background")
                     return Local.OK
                 }
             }
@@ -1075,6 +1691,7 @@ object PlaylistStore {
             val b = build(c, u, gz, true, Charsets.UTF_8, ask, null)
             val p = b.parsed
             if (p.counts.isEmpty()) return Local.NONE
+            PlaylistDiag.log("stored list", PlaylistDiag.summary(p.items) + " hidden=${b.hidden.sorted()}")
             val epg = head?.epg?.takeIf { it.isNotEmpty() } ?: epgFor(u, p.epgUrls)
             val order = head?.order ?: emptyMap()
             phase = "Playlist wird gespeichert …"; downloadDone = true
@@ -1100,12 +1717,13 @@ object PlaylistStore {
      */
     suspend fun load(
         c: Context, url: String, save: Boolean, skipNetworkWhenCached: Boolean = false,
-        ask: Boolean = true, resumed: Boolean = false
+        ask: Boolean = true, resumed: Boolean = false, startup: Boolean = false
     ): Boolean {
         if (!loadLock.tryLock()) return rawChannels.isNotEmpty()
         try {
-            return loadInner(c, url, save, skipNetworkWhenCached, ask, resumed)
+            return loadInner(c, url, save, skipNetworkWhenCached, ask, resumed, startup)
         } finally {
+            pre = null   // T-047: an unused read-ahead must not keep the list in memory
             loading = false   // also on cancel: otherwise the loading state (and the screen keep-awake) would stay stuck
             heavy = false
             langAsk = null
@@ -1116,9 +1734,14 @@ object PlaylistStore {
         }
     }
 
-    private suspend fun loadInner(c: Context, url: String, save: Boolean, skipNetworkWhenCached: Boolean, ask: Boolean, resumed: Boolean): Boolean {
+    private suspend fun loadInner(c: Context, url: String, save: Boolean, skipNetworkWhenCached: Boolean, ask: Boolean, resumed: Boolean, startup: Boolean = false): Boolean {
         ensure(c)
         val u = PlaylistLogic.normalizeUrl(url) ?: run { error = "Bitte eine gültige Adresse eingeben (beginnt mit http:// oder https://)."; return false }
+        // Restore the saved sublist for this playlist so the filter is applied while loading.
+        val h = key(u)
+        val savedName = SublistStore.active(c, h)
+        val savedFilter = savedName?.let { SublistStore.allFor(c, h).firstOrNull { it.name == savedName }?.filter }
+        if (savedFilter != null) setSublistForLoad(c, u, savedFilter, savedName)
         job = currentCoroutineContext()[Job]
         loading = true; error = null; heavy = false
         phase = "Gespeicherte Playlist wird gelesen …"; bytesRead = 0L; totalBytes = -1L; downloadDone = false
@@ -1141,6 +1764,9 @@ object PlaylistStore {
             if (save) finishSave(c, u)
             return true
         }
+        // T-047: the stored list is on screen: start the silent refresh a few seconds later, so the first screens are not slowed down
+        val wait = StartupLogic.refreshDelayMs(usedCache, userStarted = !startup)
+        if (wait > 0) kotlinx.coroutines.delay(wait)
         error = null
         val before = sig(primaryItems)
         heavy = true
@@ -1151,6 +1777,7 @@ object PlaylistStore {
                 val gzTmp = tmp(gzFile(c, u))
                 val b = build(c, u, src, false, cs, ask, gzTmp, forceAsk)
                 val parsed = b.parsed
+                PlaylistDiag.log("parsed", PlaylistDiag.summary(parsed.items) + " languages=${parsed.counts.size} hidden=${b.hidden.sorted()}")
                 if (parsed.counts.isEmpty()) throw PlaylistError("Keine Sender in der Playlist gefunden.")
                 downloadDone = true
                 val urls = epgFor(u, parsed.epgUrls)
@@ -1158,15 +1785,18 @@ object PlaylistStore {
                 val order = fetchOrder(u)
                 phase = "Playlist wird gespeichert …"
                 writeCache(c, u, parsed.items, urls, order, parsed.counts, parsed.bytes, b.hidden)
+                saveTypeCounts(c, u, parsed.items)
                 Catchup.saveParsed(c, u, parsed.catchup)
                 commitGz(c, u, gzTmp)
                 val list = parsed.items
                 if (sig(list) != before || !usedCache || b.hidden != shownHidden) show(c, u, list, urls, order, parsed.counts, parsed.bytes, b.hidden)
                 else { primaryEpg = urls; primaryOrder = order; langCounts = parsed.counts; langBytes = parsed.bytes; restartCatchup(c) }
+                reportLoad(u, parsed, b.hidden)
                 // Renew further shown playlists from the server as well
                 loadExtras(c, network = true)
                 if (save) finishSave(c, u)
                 askNext = false
+                refreshError = null
                 true
             } catch (e: CancellationException) {
                 if (save) failPending(c, MSG_CANCEL)
@@ -1175,18 +1805,31 @@ object PlaylistStore {
                 if (cancelled()) { if (save) failPending(c, MSG_CANCEL); throw CancellationException("abgebrochen") }
                 val msg = if (e is ParseStop) MSG_TOO_BIG else PlaylistLogic.friendlyError(e)
                 if (e is ParseStop) askNext = true
-                if (rawChannels.isEmpty() || save) error = msg
+                PlaylistDiag.log("load failed", e.javaClass.simpleName)
+                if (rawChannels.isEmpty() || save) error = msg else refreshError = msg
                 if (save) failPending(c, msg)
                 usedCache
             } catch (e: OutOfMemoryError) {
                 askNext = true
                 if (save) failPending(c, MSG_TOO_BIG)
-                if (rawChannels.isEmpty() || save) error = MSG_TOO_BIG
+                PlaylistDiag.log("load failed", "OutOfMemoryError")
+                if (rawChannels.isEmpty() || save) error = MSG_TOO_BIG else refreshError = MSG_TOO_BIG
                 usedCache
             }
         }
         loading = false
         return ok
+    }
+
+    /** T-067: load report for Settings > Diagnostics (where the provider's entries went). Never fails the load. */
+    private fun reportLoad(u: String, p: ParsedPlaylist, hidden: Set<String>) {
+        runCatching {
+            var live = 0; var movies = 0; var series = 0
+            for (i in p.items) when (i.kind) { Kind.LIVE -> live++; Kind.MOVIE -> movies++; Kind.SERIES -> series++ }
+            val filters = Parental.hideAdult || DeadLinks.hide || !IgnoredGroups.isEmpty
+            val shown = if (filters) shownOf(p.items).size else p.items.size
+            Diag.note(LoadReportLogic.line(hostOf(u), p.report, live, movies, series, shown, p.items.size, hidden - LangTagLogic.PSEUDO))
+        }
     }
 
     /** Newly added playlist loaded successfully: adopt it into the list and delete the remembered job. */
@@ -1211,6 +1854,7 @@ object PlaylistStore {
             loading = true; error = null
             phase = "Sprachauswahl wird angewendet …"; bytesRead = 0L; totalBytes = -1L; downloadDone = false
             val prev = shownHidden
+            PlaylistDiag.log("languages", "hidden=${LangFilter.hidden.sorted()}")
             // Little memory free: release the old list first, otherwise old and new list would be in memory at once
             if (Mem.heapTight(0.45)) setItems(emptyList())
             val r = withContext(Dispatchers.IO) { fromLocal(c, u, allowGz = true, ask = false) }
@@ -1254,6 +1898,7 @@ object PlaylistStore {
                     val b = build(c, u, src, false, cs, false, gzTmp)
                     if (b.parsed.counts.isEmpty()) return@withContext false
                     writeCache(c, u, b.parsed.items, epgFor(u, b.parsed.epgUrls), fetchOrder(u), b.parsed.counts, b.parsed.bytes, b.hidden)
+                    saveTypeCounts(c, u, b.parsed.items)
                     Catchup.saveParsed(c, u, b.parsed.catchup)
                     commitGz(c, u, gzTmp)
                     true
@@ -1271,6 +1916,27 @@ object PlaylistStore {
             job = null
             loadLock.unlock()
         }
+    }
+
+    /**
+     * "Reload playlist from scratch" (playlist settings): forgets everything stored for the active playlist – cache,
+     * stored whole list, downloaded and partial files, and the remembered "load via API" – and downloads it again.
+     * The old list is released first, so old and new list are never in memory at once.
+     * Kept: the playlist itself, its name, backup servers, content mode and language selection. false = a load is running.
+     */
+    suspend fun reloadFromScratch(c: Context): Boolean {
+        ensure(c)
+        val u = savedUrl(c) ?: return false
+        if (loading || loadLock.isLocked) return false
+        val files = listOf(cacheFile(c, u), gzFile(c, u), rawFile(c, u), partFile(c, u), infoFile(c, u))
+        bumpGen(u)
+        withContext(Dispatchers.IO) { (files + files.map { tmp(it) }).forEach { runCatching { it.delete() } } }
+        prefs(c).edit().remove(apiKey(u)).apply()
+        PlaylistDiag.log("reload from scratch", "stored files deleted")
+        refreshError = null
+        primaryItems = emptyList()
+        setItems(emptyList())
+        return load(c, u, save = false)
     }
 
     /** Delete a fully downloaded raw file that is unusable in the background (space); a partial file stays for resuming. */

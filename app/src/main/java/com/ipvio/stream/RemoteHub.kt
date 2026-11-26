@@ -10,6 +10,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.media3.common.C
 import androidx.media3.common.Player
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -43,8 +47,18 @@ object RemoteHub {
     fun start(ctx: Context): PhoneImport? {
         appCtx = ctx.applicationContext
         server?.let { if (active) return it }
-        val s = PhoneImport { }
+        // Playlist sent from the phone settings (issue 18): added like "Add playlist" on the TV
+        val s = PhoneImport { inp ->
+            main.post {
+                val c = appCtx ?: return@post
+                val u = if (inp.isXtream) PlaylistStore.xtreamUrl(inp.host, inp.user, inp.pass) else inp.url
+                if (u != null) PlaylistStore.addAsync(c, u)
+            }
+        }
         s.onList = { name, bytes -> main.post { appCtx?.let { ListImportApply.run(it, name, bytes) } } }
+        // Trakt sign-in from the phone page (T-031): the TV keeps the verifier and exchanges the code
+        s.traktStart = { TraktSignIn.start() }
+        s.traktFinish = { code, state -> appCtx?.let { TraktSignIn.finish(it, code, state) } ?: TraktAuth.Outcome.REJECTED }
         s.api = { name, q ->
             // The phone opened the page or used it: close the QR card on the TV (it would otherwise stay in front of the player).
             // "state" is polled all the time and must not count.
@@ -77,7 +91,7 @@ object RemoteHub {
 
     /** Live channel for the phone: like [itemJson] plus favorite flag and the running show (from the loaded XMLTV, no network). */
     private fun liveJson(i: Item): String {
-        val cur = Epg.current(Xmltv.forChannel(i.tvgId))
+        val cur = Epg.current(Xmltv.forItem(i))
         return RemoteLogic.live(itemJson(i), Library.isFav(i.id), cur?.title, cur?.start ?: 0L, cur?.end ?: 0L)
     }
 
@@ -86,11 +100,32 @@ object RemoteHub {
         return when (name) {
             "search" -> {
                 if (all.isEmpty()) return "{\"loading\":true}"
-                val (m, s, l) = SearchCache.build(all).find(q["q"].orEmpty().take(80))
+                val (m, s, l) = SearchCache.build(PrivateCats.visible(all)).find(q["q"].orEmpty().take(80))
                 "{\"nm\":${m.size},\"ns\":${s.size},\"nl\":${l.size}," +
                     "\"m\":" + RemoteLogic.arr(m.take(LIMIT).map(::itemJson)) +
                     ",\"s\":" + RemoteLogic.arr(s.take(LIMIT).map(::itemJson)) +
                     ",\"l\":" + RemoteLogic.arr(l.take(LIMIT).map(::liveJson)) + "}"
+            }
+            "prog" -> {
+                // Programme search (T-051a): the loaded guide of the visible live channels; "t" = live or up (upcoming)
+                val mode = if (q["t"] == "up") ProgSearchLogic.Mode.UPCOMING else ProgSearchLogic.Mode.LIVE
+                val text = q["q"].orEmpty().take(80)
+                val hits = ArrayList<ProgSearchLogic.Hit>()
+                val live = PrivateCats.visible(all).filter { it.kind == Kind.LIVE }
+                // Channels whose guide is in the loaded XMLTV
+                for (c in live) {
+                    if (!Xmltv.hasItem(c)) continue
+                    for (e in Xmltv.forItem(c)) if (ProgSearchLogic.matches(e.title, text)) hits.add(ProgSearchLogic.Hit(c.id, c.title, e.title, e.start, e.end))
+                }
+                // Xtream channels without XMLTV guide: short guide per channel (Epg.now caches it for 2 minutes).
+                // At most XTREAM_FETCH_PER_REQUEST channels are fetched per request, so the first search can be partial.
+                val xt = live.filter { !Xmltv.hasItem(it) && Epg.supported(it) }
+                val need = xt.filter { Epg.peek(it) == null }.take(ProgSearchLogic.XTREAM_FETCH_PER_REQUEST)
+                if (need.isNotEmpty()) runCatching {
+                    runBlocking { withTimeoutOrNull(9_000) { need.map { async { Epg.now(it) } }.awaitAll() } }
+                }
+                for (c in xt) for (e in Epg.peek(c).orEmpty()) if (ProgSearchLogic.matches(e.title, text)) hits.add(ProgSearchLogic.Hit(c.id, c.title, e.title, e.start, e.end))
+                RemoteLogic.arr(ProgSearchLogic.select(hits, System.currentTimeMillis() / 1000, mode).map { RemoteLogic.prog(it.channelId, it.channel, it.title, it.start, it.end) })
             }
             "resume" -> {
                 val byId = all.associateBy { it.id }
@@ -163,6 +198,12 @@ object RemoteHub {
                 "{\"ok\":true}"
             }
             "ctl" -> control(q["c"].orEmpty(), q["v"].orEmpty())
+            // Settings and Sports Hub on the phone (issues 17, 18, 20, 21)
+            "pls", "plmain", "plren", "pldel", "vcats", "vhide", "vfav", "vmove", "adult", "adultset", "langs", "setlang",
+            "sport", "sleagues", "steams", "stfav", "spin", "swatch" -> {
+                val c = appCtx ?: return null
+                RemoteMore.handle(name, q, c, { f -> main.post { f() } }, { f -> onMain(false, f) })
+            }
             "state" -> onMain(RemoteLogic.state(false, "", false, 0, 0, false)) {
                 val p = player
                 if (p == null) RemoteLogic.state(false, "", false, 0, 0, false)

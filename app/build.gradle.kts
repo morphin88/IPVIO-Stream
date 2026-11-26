@@ -36,8 +36,8 @@ android {
         minSdk = 24
         targetSdk = 37
         // Raise both for every release; the GitHub release tag must match versionName (e.g. tag "v1.1").
-        versionCode = 6
-        versionName = "1.4.1"
+        versionCode = 17
+        versionName = "1.5.1"
         // Name under the icon; the debug build overrides it (see buildTypes)
         manifestPlaceholders["appLabel"] = "IPVIO Stream"
 
@@ -45,6 +45,8 @@ android {
         buildConfigField("String", "OMDB_KEY", "\"${secret("OMDB_KEY")}\"")
         buildConfigField("String", "GOOGLE_CLIENT_ID", "\"${secretId("GOOGLE_CLIENT_ID")}\"")
         buildConfigField("String", "GOOGLE_CLIENT_SECRET", "\"${secretId("GOOGLE_CLIENT_SECRET")}\"")
+        // Trakt API application (T-031, PKCE: no client secret is issued): empty until set in secrets.properties or as an environment variable
+        buildConfigField("String", "TRAKT_CLIENT_ID", "\"${secretId("TRAKT_CLIENT_ID")}\"")
     }
 
     signingConfigs {
@@ -78,7 +80,7 @@ android {
                 // kotlin.text class, in androidx.startup.InitializationProvider); during 1.2 a build with com.ipvio.** in the
                 // scope (12.7 MB) did not start either (cause unknown, see ADR 0001).
                 // Rollback: set enable = false (this one line).
-                enable = false
+                enable = true
             }
         }
     }
@@ -107,8 +109,13 @@ dependencies {
     // MPEG-DASH (.mpd) streams; without it Media3 throws IllegalStateException when such a stream is opened
     implementation("androidx.media3:media3-exoplayer-dash:1.11.1")
     implementation("androidx.media3:media3-ui:1.11.1")
+    // MetadataRetriever: reads the tracks of a stream from its header for the detail page (MediaProbe.kt, T-033)
+    implementation("androidx.media3:media3-inspector:1.11.1")
     // Software audio decoder (AC3/E-AC3/DTS ...) for headphones/Bluetooth, see SoftAudio.kt. GPL-3.0 – the reason the app is GPL-3.0.
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.9.0+1")
+
+    // T-049e: VPN with WireGuard (official tunnel library, Apache-2.0; runs the Go backend and the VpnService). See AppVpn.kt
+    implementation("com.wireguard.android:tunnel:1.0.20230706")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.coil-kt:coil-compose:2.7.0")

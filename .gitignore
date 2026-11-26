@@ -1,23 +1,21 @@
-# Build
-*.iml
-.gradle/
-.kotlin/
-build/
-/captures
-.externalNativeBuild
-.cxx
+# Private playlist extraction helper (never commit - contains no URL but is a local-only tool)
+extract_playlist_info.py
+playlist_categories_languages.csv
+ipvio_backup.json
 
-# Android Studio
-.idea/
+# Android
+*.apk
+*.aab
+build/
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
 .DS_Store
 
-# Local machine and private data – never commit
-local.properties
+# Local secrets (CLAUDE.md section 10): API keys, OAuth client IDs, signing keys
 secrets.properties
+keystore.properties
 *.jks
 *.keystore
-keystore.properties
-*.apk
-
-# Full-size screenshot originals (the repository uses the smaller .jpg copies)
-docs/screenshots/*.png
