@@ -36,4 +36,5 @@ Keine Teilliste (vollständige Playlist)¦Brak podlisty (cała playlista)
 Keine Teillisten¦Brak podlist
 Neue Teillisten legst du an, indem du bei „Playlist hinzufügen“ die Teilliste einschaltest, Felder ausfüllst und „Hinzufügen“ drückst. Sie werden dann hier aufgelistet und können aktiviert oder gelöscht werden.¦Nowe podlisty tworzysz, włączając podlistę w „Dodaj playlistę”, wypełniając pola i naciskając „Dodaj”. Zostaną tu wylistowane i można je aktywować lub usunąć.
 Alle paar Stunden¦Co kilka godzin
+Bulgarisch¦Bułgarski
 """
