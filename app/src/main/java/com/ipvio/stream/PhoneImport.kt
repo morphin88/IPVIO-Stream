@@ -10,7 +10,11 @@ import java.net.URLDecoder
 import java.security.SecureRandom
 import kotlin.concurrent.thread
 
-/** A playlist sent from the phone: either an M3U link or Xtream login data. */
+/**
+ * A playlist sent from the phone: an M3U link, Xtream login data or a Stalker portal. A Stalker login is carried in [url]
+ * in its stored form ("stalker:PORTAL#mac=MAC…", see [StalkerLogic.Source.encode]), so every receiver that stores [url] as
+ * a playlist address handles it without further changes.
+ */
 class PhoneInput(
     val url: String,
     val host: String,
@@ -18,6 +22,7 @@ class PhoneInput(
     val pass: String,
 ) {
     val isXtream get() = url.isBlank()
+    val isStalker get() = StalkerLogic.isSource(url)
 }
 
 /** Pure helper functions (testable, without Android). */
@@ -36,6 +41,12 @@ object PhoneImportLogic {
         if (url.isNotEmpty()) return if (url.startsWith("http://") || url.startsWith("https://")) PhoneInput(
             url, "", "", ""
         ) else null
+        // Stalker portal: portal address + MAC, serial number and device IDs optional
+        val portal = f["portal"].orEmpty().trim()
+        if (portal.isNotEmpty()) {
+            val src = StalkerLogic.source(portal, f["mac"].orEmpty(), f["sn"].orEmpty(), f["id1"].orEmpty(), f["id2"].orEmpty()) ?: return null
+            return PhoneInput(src.encode(), "", "", "")
+        }
         val host = f["host"].orEmpty().trim()
         val user = f["user"].orEmpty().trim()
         val pass = f["pass"].orEmpty().trim()
@@ -101,6 +112,14 @@ button{width:100%;padding:14px;margin-top:10px;border:0;border-radius:10px;backg
 <input name="host" placeholder="${t("Server (z. B. http://server.tld:8080)", "Server (e.g. http://server.tld:8080)")}">
 <input name="user" placeholder="${t("Benutzername", "Username")}" autocapitalize="off">
 <input name="pass" placeholder="${t("Passwort", "Password")}" autocapitalize="off">
+<button type="submit">${t("An den Fernseher senden", "Send to TV")}</button></form>
+<form method="post" action="/send"><h2>${t("oder Stalker-Portal", "or Stalker portal")}</h2>
+<input name="code" inputmode="numeric" maxlength="4" placeholder="${t("Code vom Fernseher", "Code from the TV")}" required>
+<input name="portal" placeholder="${t("Portal-Adresse (z. B. http://portal.tld:8080/c/)", "Portal address (e.g. http://portal.tld:8080/c/)")}" autocapitalize="off">
+<input name="mac" placeholder="${t("MAC-Adresse (z. B. 00:1A:79:12:34:56)", "MAC address (e.g. 00:1A:79:12:34:56)")}" autocapitalize="off">
+<input name="sn" placeholder="${t("Seriennummer (optional)", "Serial number (optional)")}" autocapitalize="off">
+<input name="id1" placeholder="${t("Device ID (optional)", "Device ID (optional)")}" autocapitalize="off">
+<input name="id2" placeholder="${t("Device ID 2 (optional)", "Device ID 2 (optional)")}" autocapitalize="off">
 <button type="submit">${t("An den Fernseher senden", "Send to TV")}</button></form>""" +
             (if (feats.upload) """<h2>${t("oder Playlist-Datei vom Handy", "or a playlist file from your phone")}</h2>
 <input id="uc" inputmode="numeric" maxlength="4" placeholder="${t("Code vom Fernseher", "Code from the TV")}">

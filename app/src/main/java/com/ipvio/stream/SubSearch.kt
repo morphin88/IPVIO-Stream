@@ -41,8 +41,10 @@ object SubSearch {
 
     private fun get(r: Request): Pair<Int, String> = client.newCall(r).execute().use { it.code to (it.body?.string().orEmpty()) }
 
-    suspend fun search(q: SubSearchLogic.Query): Result = withContext(Dispatchers.IO) {
-        val bgWanted = "bg" in q.langs && q.title.isNotBlank()
+    suspend fun search(query: SubSearchLogic.Query): Result = withContext(Dispatchers.IO) {
+        // Fork build: the Bulgarian sites need no key and are always searched; Bulgarian hits come after the chosen languages
+        val q = if ("bg" in query.langs) query else query.copy(langs = query.langs + "bg")
+        val bgWanted = q.title.isNotBlank()
         if (!hasKeys() && !bgWanted) return@withContext Result(emptyList(), "Kein Schlüssel für die Untertitel-Suche. Einstellungen > API-Schlüssel")
         if (q.tmdbId <= 0 && q.title.isBlank()) return@withContext Result(emptyList(), "Titel unbekannt")
         coroutineScope {

@@ -69,8 +69,10 @@ fun AddPlaylistScreen(onDone: () -> Unit) {
         PhoneImport { inp ->
             Handler(Looper.getMainLooper()).post {
                 val u = if (inp.isXtream) PlaylistStore.xtreamUrl(inp.host, inp.user, inp.pass) else inp.url
-                stalker = false
-                if (inp.isXtream) { xtream = true; host = inp.host; user = inp.user; pass = inp.pass } else { xtream = false; url = inp.url }
+                val st = if (inp.isStalker) StalkerLogic.parse(inp.url) else null
+                stalker = st != null
+                if (st != null) { xtream = false; portal = st.portal; mac = st.mac; sn = st.sn; devId = st.id1; devId2 = st.id2 }
+                else if (inp.isXtream) { xtream = true; host = inp.host; user = inp.user; pass = inp.pass } else { xtream = false; url = inp.url }
                 if (u == null) PlaylistStore.error = "Angaben unvollständig: Server, Benutzername und Passwort nötig."
                 else {
                     scope.launch { if (PlaylistStore.load(ctx, u, true)) onDone() }

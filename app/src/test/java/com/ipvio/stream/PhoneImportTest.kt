@@ -19,6 +19,27 @@ class PhoneImportTest {
         assertNull(PhoneImportLogic.toInput(emptyMap()))
     }
 
+    @Test fun stalkerInputFromPhonePage() {
+        val i = PhoneImportLogic.toInput(mapOf("portal" to "portal.tld:8080/c/", "mac" to "00-1a-79-12-34-56", "sn" to "AB 12", "id1" to "x9"))!!
+        assertTrue(i.isStalker)
+        assertFalse(i.isXtream)
+        val src = StalkerLogic.parse(i.url)!!
+        assertEquals("http://portal.tld:8080/c/", src.portal)
+        assertEquals("00:1A:79:12:34:56", src.mac)
+        assertEquals("AB12", src.sn)
+        assertEquals("x9", src.id1)
+        // Invalid MAC or missing portal is rejected; the M3U link still wins when both are sent
+        assertNull(PhoneImportLogic.toInput(mapOf("portal" to "portal.tld", "mac" to "1234")))
+        assertNull(PhoneImportLogic.toInput(mapOf("mac" to "00:1A:79:12:34:56")))
+        assertFalse(PhoneImportLogic.toInput(mapOf("url" to "http://a/b.m3u", "portal" to "p.tld", "mac" to "00:1A:79:12:34:56"))!!.isStalker)
+    }
+
+    @Test fun phonePageHasStalkerForm() {
+        val html = PhoneImportLogic.page(1, PhoneImportLogic.Features(false, false, false, false, false, false, false))
+        assertTrue(html.contains("name=\"portal\""))
+        assertTrue(html.contains("name=\"mac\""))
+    }
+
     @Test fun codeHatVierStellen() {
         repeat(50) { assertEquals(4, PhoneImportLogic.newCode(java.util.Random(it.toLong())).length) }
     }
